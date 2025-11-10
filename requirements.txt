@@ -1,0 +1,13 @@
+# Electric Port Simulator - Python Dependencies
+# Database
+# SQLite is included in Python standard library
+
+# Visualization and debugging
+streamlit>=1.28.0
+pandas>=2.0.0
+
+# Future dependencies (uncomment as needed):
+# numpy>=1.24.0
+# matplotlib>=3.7.0  # for visualization
+# pydantic>=2.0.0    # alternative to dataclasses with validation
+
