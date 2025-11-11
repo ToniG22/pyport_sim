@@ -2,11 +2,12 @@
 
 import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict
 
-from models import Port, BoatState, ChargerState
+from models import Port, BoatState, ChargerState, Trip
 from database import DatabaseManager
 from config import Settings, SimulationMode
+from simulation.trip_manager import TripManager
 
 
 class SimulationEngine:
@@ -19,6 +20,7 @@ class SimulationEngine:
         db_manager: DatabaseManager,
         start_date: Optional[datetime] = None,
         days: int = 1,
+        trips_directory: str = "assets/trips",
     ):
         """
         Initialize the simulation engine.
@@ -29,6 +31,7 @@ class SimulationEngine:
             db_manager: Database manager
             start_date: Simulation start date (default: today at midnight UTC)
             days: Number of days to simulate (max 7)
+            trips_directory: Directory containing trip CSV files
         """
         self.port = port
         self.settings = settings
@@ -53,14 +56,21 @@ class SimulationEngine:
         # Track boat-charger assignments
         self.boat_charger_map = {}  # {boat_name: charger_name}
 
-        # Trip schedule: (start_hour, duration_hours)
+        # Trip schedule times: (start_hour, slot_number)
         self.trip_schedule = [
-            (9, 3),  # 9:00 AM, 3 hours
-            (14, 3),  # 2:00 PM, 3 hours
+            (9, 0),  # 9:00 AM, slot 0
+            (14, 1),  # 2:00 PM, slot 1
         ]
 
-        # Track which boats are on which trips
-        self.boat_trip_status = {}  # {boat_name: (trip_start_datetime, trip_end_datetime)}
+        # Initialize trip manager
+        print(f"\nLoading trips from {trips_directory}...")
+        self.trip_manager = TripManager(trips_directory)
+
+        # Track active trips: {boat_name: (trip, start_datetime, elapsed_seconds)}
+        self.active_trips: Dict[str, tuple[Trip, datetime, float]] = {}
+
+        # Track last date we assigned trips (to assign at midnight)
+        self.last_assignment_date: Optional[str] = None
 
     def run(self):
         """Run the simulation based on the configured mode."""
@@ -135,6 +145,9 @@ class SimulationEngine:
 
     def _simulate_timestep(self):
         """Simulate a single timestep."""
+        # 0. Assign daily trips at midnight (00:00)
+        self._assign_daily_trips_if_midnight()
+
         # 1. Check and handle trip schedules
         self._handle_trips()
 
@@ -147,6 +160,30 @@ class SimulationEngine:
         # 4. Save measurements to database
         self._save_measurements()
 
+    def _assign_daily_trips_if_midnight(self):
+        """Assign trips for all boats at midnight (00:00)."""
+        current_date_str = self.current_datetime.strftime("%Y-%m-%d")
+
+        # Check if it's midnight and we haven't assigned for this date yet
+        if self.current_datetime.hour == 0 and self.current_datetime.minute == 0:
+            if self.last_assignment_date != current_date_str:
+                print(f"\n  📅 Assigning trips for {current_date_str}")
+                weekday_name = self.current_datetime.strftime("%A")
+                print(f"     Day: {weekday_name}")
+
+                for boat in self.port.boats:
+                    trips = self.trip_manager.assign_daily_trips(
+                        boat.name, self.current_datetime
+                    )
+                    if trips:
+                        trip_names = [t.route_name for t in trips]
+                        print(f"     {boat.name}: {len(trips)} trip(s) - {trip_names}")
+                    else:
+                        print(f"     {boat.name}: No trips (rest day)")
+
+                self.last_assignment_date = current_date_str
+                print()
+
     def _handle_trips(self):
         """Handle boat trips based on schedule."""
         current_hour = self.current_datetime.hour
@@ -156,75 +193,89 @@ class SimulationEngine:
             boat_name = boat.name
 
             # Check if boat is currently on a trip
-            if boat_name in self.boat_trip_status:
-                trip_start, trip_end = self.boat_trip_status[boat_name]
-                if self.current_datetime >= trip_end:
+            if boat_name in self.active_trips:
+                trip, start_time, elapsed = self.active_trips[boat_name]
+
+                # Update elapsed time
+                elapsed += self.settings.timestep
+
+                # Check if trip is complete
+                if elapsed >= trip.duration:
                     # Trip completed, return to port
                     boat.state = BoatState.IDLE
                     print(
-                        f"  ← {boat.name} returned from trip at {self.current_datetime.strftime('%H:%M')}, SOC={boat.soc:.1%}"
+                        f"  ← {boat.name} returned from {trip.route_name} at {self.current_datetime.strftime('%H:%M')}, SOC={boat.soc:.1%}"
                     )
-                    del self.boat_trip_status[boat_name]
+                    del self.active_trips[boat_name]
                 else:
-                    # Still on trip, discharge battery
-                    self._discharge_boat(boat)
+                    # Still on trip, discharge battery based on current speed from CSV
+                    self._discharge_boat_on_trip(boat, trip, elapsed)
+                    self.active_trips[boat_name] = (trip, start_time, elapsed)
                 continue
 
             # Check if it's time to start a new trip
-            for start_hour, duration_hours in self.trip_schedule:
+            for start_hour, slot in self.trip_schedule:
                 # Start trip at the scheduled hour (check within the timestep window)
                 if current_hour == start_hour and current_minute < (
                     self.settings.timestep / 60
                 ):
-                    # Check if boat has enough charge to make the trip (SOC > 20%)
-                    if boat.soc > 0.2:
-                        # Check if we haven't already started this trip
-                        trip_already_started = False
-                        if boat_name in self.boat_trip_status:
-                            trip_start, _ = self.boat_trip_status[boat_name]
-                            # If trip started within the last hour, don't start again
-                            if (
-                                self.current_datetime - trip_start
-                            ).total_seconds() < 3600:
-                                trip_already_started = True
+                    # Get assigned trip for this slot
+                    trip = self.trip_manager.get_trip_for_slot(
+                        boat_name, self.current_datetime, slot
+                    )
 
-                        if not trip_already_started:
-                            # Disconnect from charger if connected
-                            if boat_name in self.boat_charger_map:
-                                charger_name = self.boat_charger_map[boat_name]
-                                charger = next(
-                                    c
-                                    for c in self.port.chargers
-                                    if c.name == charger_name
-                                )
-                                charger.state = ChargerState.IDLE
-                                charger.power = 0.0
-                                charger.connected_boat = None
-                                del self.boat_charger_map[boat_name]
+                    if trip is None:
+                        continue  # No trip assigned for this slot
 
-                            # Start trip
-                            trip_end = self.current_datetime + timedelta(
-                                hours=duration_hours
-                            )
-                            self.boat_trip_status[boat_name] = (
-                                self.current_datetime,
-                                trip_end,
-                            )
-                            boat.state = BoatState.SAILING
-                            print(
-                                f"  → {boat.name} starting trip at {self.current_datetime.strftime('%H:%M')}, SOC={boat.soc:.1%}"
-                            )
-                            break
+                    # Estimate energy required for trip
+                    estimated_energy = trip.estimate_energy_required(boat.k)
+                    required_soc = estimated_energy / boat.battery_capacity
 
-    def _discharge_boat(self, boat):
-        """Discharge boat battery during sailing."""
-        # Calculate energy consumption for this timestep
-        # Power consumption = k * speed^3
-        speed = boat.range_speed  # knots
-        power = boat.k * (speed**3)  # kW
+                    # Check if boat has enough charge
+                    if boat.soc >= required_soc:
+                        # Disconnect from charger if connected
+                        if boat_name in self.boat_charger_map:
+                            charger_name = self.boat_charger_map[boat_name]
+                            charger = next(
+                                c for c in self.port.chargers if c.name == charger_name
+                            )
+                            charger.state = ChargerState.IDLE
+                            charger.power = 0.0
+                            charger.connected_boat = None
+                            del self.boat_charger_map[boat_name]
+
+                        # Start trip
+                        self.active_trips[boat_name] = (
+                            trip,
+                            self.current_datetime,
+                            0.0,
+                        )
+                        boat.state = BoatState.SAILING
+                        print(
+                            f"  → {boat.name} starting {trip.route_name} at {self.current_datetime.strftime('%H:%M')}, "
+                            f"SOC={boat.soc:.1%} (need {required_soc:.1%})"
+                        )
+                        break
+                    else:
+                        print(
+                            f"  ⚠️  {boat.name} cannot start {trip.route_name} - insufficient charge "
+                            f"(has {boat.soc:.1%}, needs {required_soc:.1%})"
+                        )
+
+    def _discharge_boat_on_trip(self, boat, trip: Trip, elapsed_seconds: float):
+        """Discharge boat battery during trip based on CSV speed data."""
+        # Get current point in the trip
+        point = trip.get_point_at_elapsed_time(elapsed_seconds)
+
+        if point is None:
+            return
+
+        # Calculate power consumption based on actual speed from CSV
+        speed_knots = point.speed
+        power_kw = boat.k * (speed_knots**3)
 
         # Energy consumed in this timestep (kWh)
-        energy_consumed = (power * self.settings.timestep) / 3600
+        energy_consumed = (power_kw * self.settings.timestep) / 3600
 
         # Update SOC
         soc_decrease = energy_consumed / boat.battery_capacity
@@ -306,7 +357,7 @@ class SimulationEngine:
     def _save_measurements(self):
         """Save current state to database."""
         measurements = []
-        
+
         # Convert current datetime to ISO format string (UTC)
         timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -317,7 +368,9 @@ class SimulationEngine:
         available_power = self.port.contracted_power - total_power_used
 
         # Port measurements
-        measurements.append((timestamp_str, "port", "total_power_used", total_power_used))
+        measurements.append(
+            (timestamp_str, "port", "total_power_used", total_power_used)
+        )
         measurements.append((timestamp_str, "port", "available_power", available_power))
         measurements.append(
             (timestamp_str, "port", "contracted_power", self.port.contracted_power)
@@ -335,17 +388,19 @@ class SimulationEngine:
                 )
             )
 
-            # Calculate current power draw
-            if boat.state == BoatState.SAILING:
-                power = boat.k * (boat.range_speed**3)
-            elif boat.state == BoatState.CHARGING and boat.name in self.boat_charger_map:
-                charger_name = self.boat_charger_map[boat.name]
-                charger = next(c for c in self.port.chargers if c.name == charger_name)
-                power = charger.effective_power
+            # Calculate current motor power (only when sailing)
+            if boat.state == BoatState.SAILING and boat.name in self.active_trips:
+                trip, _, elapsed = self.active_trips[boat.name]
+                point = trip.get_point_at_elapsed_time(elapsed)
+                if point:
+                    motor_power = boat.k * (point.speed**3)
+                else:
+                    motor_power = 0.0
             else:
-                power = 0.0
+                # Motor is off when charging or idle
+                motor_power = 0.0
 
-            measurements.append((timestamp_str, boat.name, "power", power))
+            measurements.append((timestamp_str, boat.name, "power", motor_power))
 
         # Charger measurements
         for charger in self.port.chargers:

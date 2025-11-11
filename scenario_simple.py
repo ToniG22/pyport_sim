@@ -21,15 +21,25 @@ def run_simple_scenario():
     )
 
     # Create 1 boat (starting at 30% charge)
-    # Boat sized for realistic trips: 3 hours at range speed needs ~150 kWh
     boat = Boat(
         name="SeaBreeze",
-        motor_power=50,  # kW
+        motor_power=120,  # kW
         weight=2500,  # kg
         length=8.5,  # m
-        battery_capacity=200,  # kWh (larger battery for longer range)
-        range_speed=8.0,  # knots
+        battery_capacity=150,  # kWh (larger battery for longer range)
+        range_speed=15.0,  # knots
         soc=0.30,  # 30% charged
+    )
+
+    # Create 2 boat with different battery capacities
+    boat2 = Boat(
+        name="SeaBreeze_2",
+        motor_power=100,  # kW
+        weight=2500,  # kg
+        length=8.5,  # m
+        battery_capacity=100,  # kWh
+        range_speed=16.0,  # knots
+        soc=0.50,  # 50% charged
     )
 
     # Create 1 charger
@@ -38,10 +48,17 @@ def run_simple_scenario():
         max_power=22,  # kW
         efficiency=0.95,  # 95% efficient
     )
+    charger2 = Charger(
+        name="FastCharger_B",
+        max_power=22,  # kW
+        efficiency=0.95,  # 95% efficient
+    )
 
-    # Add boat and charger to port
+    # Add boats and charger to port
     port.add_boat(boat)
+    port.add_boat(boat2)
     port.add_charger(charger)
+    port.add_charger(charger2)
 
     print(f"\nPort: {port}")
     print(f"Boat: {boat}")
