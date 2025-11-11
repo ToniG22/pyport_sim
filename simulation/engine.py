@@ -1,7 +1,7 @@
 """Core simulation engine for the electric port simulator."""
 
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 
 from models import Port, BoatState, ChargerState, Trip
@@ -40,7 +40,7 @@ class SimulationEngine:
 
         # Set start date to today at midnight UTC if not provided
         if start_date is None:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             self.start_date = datetime(now.year, now.month, now.day, 0, 0, 0)
         else:
             self.start_date = start_date
@@ -79,7 +79,9 @@ class SimulationEngine:
         self.forecast_loaded = False
 
         if self.port.pv_systems:
-            print(f"\nInitializing weather data for {len(self.port.pv_systems)} PV system(s)...")
+            print(
+                f"\nInitializing weather data for {len(self.port.pv_systems)} PV system(s)..."
+            )
             self.weather_client = OpenMeteoClient(self.port.lat, self.port.lon)
             self._load_weather_forecast()
 
@@ -162,16 +164,19 @@ class SimulationEngine:
         # 1. Update PV production based on weather
         self._update_pv_production()
 
-        # 2. Check and handle trip schedules
+        # 2. Update BESS (default control strategy)
+        self._update_bess()
+
+        # 3. Check and handle trip schedules
         self._handle_trips()
 
-        # 3. Check which boats need charging and assign to chargers
+        # 4. Check which boats need charging and assign to chargers
         self._assign_boats_to_chargers()
 
-        # 4. Update charging for boats
+        # 5. Update charging for boats
         self._update_charging()
 
-        # 5. Save measurements to database
+        # 6. Save measurements to database
         self._save_measurements()
 
     def _assign_daily_trips_if_midnight(self):
@@ -314,12 +319,22 @@ class SimulationEngine:
             c for c in self.port.chargers if c.state == ChargerState.IDLE
         ]
 
-        # Calculate available power at port (including PV production)
+        # Calculate available power at port (including PV production and BESS discharge)
         used_power = sum(
             c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
         )
         pv_production = sum(pv.current_production for pv in self.port.pv_systems)
-        available_power = self.port.contracted_power + pv_production - used_power
+
+        # BESS contribution (negative power means discharging, adds to available power)
+        bess_discharge = sum(
+            -bess.current_power
+            for bess in self.port.bess_systems
+            if bess.current_power < 0
+        )
+
+        available_power = (
+            self.port.contracted_power + pv_production + bess_discharge - used_power
+        )
 
         # Assign boats to chargers
         for boat in boats_needing_charge:
@@ -401,7 +416,11 @@ class SimulationEngine:
             if i < len(values):
                 self.weather_forecast[ts_str] = {}
                 for metric, values in forecast_data.items():
-                    if metric != "timestamps" and i < len(values) and values[i] is not None:
+                    if (
+                        metric != "timestamps"
+                        and i < len(values)
+                        and values[i] is not None
+                    ):
                         self.weather_forecast[ts_str][metric] = float(values[i])
 
         # Save to database
@@ -454,6 +473,60 @@ class SimulationEngine:
                 timestamp=self.current_datetime,
             )
 
+    def _update_bess(self):
+        """
+        Update BESS charge/discharge based on default control strategy.
+
+        Default strategy:
+        - Charge from surplus PV production (when PV > charger load)
+        - Discharge when needed (when contracted + PV < charger load)
+        - Respect SOC limits (10% min, 90% max by default)
+        """
+        if not self.port.bess_systems:
+            return
+
+        # Calculate current power flows
+        pv_production = sum(pv.current_production for pv in self.port.pv_systems)
+        charger_load = sum(
+            c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
+        )
+
+        # PV surplus = excess PV not used by chargers
+        # Positive means excess PV available for charging BESS
+        pv_surplus = pv_production - charger_load
+
+        # Power deficit = chargers need more than grid + PV can provide
+        # Positive means we need to discharge BESS
+        power_deficit = charger_load - (self.port.contracted_power + pv_production)
+
+        for bess in self.port.bess_systems:
+            if pv_surplus > 0:
+                # Excess PV available - charge BESS with the PV surplus ONLY
+                max_charge = bess.get_max_charge_power_available(self.settings.timestep)
+                charge_power = min(pv_surplus, max_charge)
+
+                if charge_power > 0.1:  # Only charge if meaningful power available
+                    bess.charge(charge_power, self.settings.timestep)
+                    pv_surplus -= charge_power
+                else:
+                    bess.idle()
+
+            elif power_deficit > 0:
+                # Power deficit - discharge BESS to cover the shortfall
+                max_discharge = bess.get_max_discharge_power_available(
+                    self.settings.timestep
+                )
+                discharge_power = min(power_deficit, max_discharge)
+
+                if discharge_power > 0.1:  # Only discharge if meaningful
+                    bess.discharge(discharge_power, self.settings.timestep)
+                    power_deficit -= discharge_power
+                else:
+                    bess.idle()
+            else:
+                # No PV surplus and no deficit - idle
+                bess.idle()
+
     def _save_measurements(self):
         """Save current state to database."""
         measurements = []
@@ -464,13 +537,25 @@ class SimulationEngine:
         # Calculate PV production
         total_pv_production = sum(pv.current_production for pv in self.port.pv_systems)
 
+        # Calculate BESS contribution
+        total_bess_power = sum(bess.current_power for bess in self.port.bess_systems)
+        # Positive = charging (consuming power), Negative = discharging (providing power)
+        bess_discharge = -total_bess_power if total_bess_power < 0 else 0
+        bess_charge = total_bess_power if total_bess_power > 0 else 0
+
         # Calculate port metrics
         total_power_used = sum(
             c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
         )
-        
-        # Available power = contracted power + PV production - power used
-        available_power = self.port.contracted_power + total_pv_production - total_power_used
+
+        # Available power = contracted power + PV production + BESS discharge - power used - BESS charge
+        available_power = (
+            self.port.contracted_power
+            + total_pv_production
+            + bess_discharge
+            - total_power_used
+            - bess_charge
+        )
 
         # Port measurements
         measurements.append(
@@ -479,6 +564,8 @@ class SimulationEngine:
         measurements.append(
             (timestamp_str, "port", "pv_production", total_pv_production)
         )
+        measurements.append((timestamp_str, "port", "bess_discharge", bess_discharge))
+        measurements.append((timestamp_str, "port", "bess_charge", bess_charge))
         measurements.append((timestamp_str, "port", "available_power", available_power))
         measurements.append(
             (timestamp_str, "port", "contracted_power", self.port.contracted_power)
@@ -526,6 +613,16 @@ class SimulationEngine:
         for pv in self.port.pv_systems:
             measurements.append(
                 (timestamp_str, pv.name, "production", pv.current_production)
+            )
+
+        # BESS measurements
+        for bess in self.port.bess_systems:
+            measurements.append(
+                (timestamp_str, bess.name, "soc", bess.current_soc * 100)
+            )
+            measurements.append((timestamp_str, bess.name, "power", bess.current_power))
+            measurements.append(
+                (timestamp_str, bess.name, "energy_stored", bess.get_energy_stored())
             )
 
         # Save to database

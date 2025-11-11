@@ -1,15 +1,15 @@
-"""Scenario with PV solar generation."""
+"""Scenario with PV solar generation and BESS (Battery Energy Storage System)."""
 
-from models import Port, Boat, Charger, PV
+from models import Port, Boat, Charger, PV, BESS, BESSControlStrategy
 from config import Settings, SimulationMode
 from database import DatabaseManager
 from simulation import SimulationEngine
 
 
-def run_pv_scenario():
-    """Run a simulation scenario with solar PV."""
+def run_bess_scenario():
+    """Run a simulation scenario with solar PV and battery storage."""
     print("=" * 60)
-    print("SCENARIO: With Solar PV Generation")
+    print("SCENARIO: With Solar PV + Battery Storage (BESS)")
     print("=" * 60)
 
     # Create port
@@ -57,12 +57,25 @@ def run_pv_scenario():
     # Create PV system (30 kW solar array)
     pv_system = PV(
         name="Solar_Array_1",
-        capacity=22.0,  # 22 kW DC
+        capacity=30.0,  # 30 kW DC
         tilt=30.0,  # 30 degrees (optimal for Madeira)
         azimuth=180.0,  # South-facing
-        efficiency=0.95,  # 95% system efficiency
+        efficiency=0.85,  # 85% system efficiency
         latitude=port.lat,
         longitude=port.lon,
+    )
+
+    # Create BESS (Battery Energy Storage System)
+    bess = BESS(
+        name="Battery_Storage_1",
+        capacity=100.0,  # 100 kWh capacity
+        max_charge_power=25.0,  # 25 kW max charge
+        max_discharge_power=25.0,  # 25 kW max discharge
+        efficiency=0.90,  # 90% round-trip efficiency
+        soc_min=0.10,  # 10% minimum SOC
+        soc_max=0.90,  # 90% maximum SOC
+        initial_soc=0.50,  # Start at 50%
+        control_strategy=BESSControlStrategy.DEFAULT,
     )
 
     # Add components to port
@@ -71,21 +84,30 @@ def run_pv_scenario():
     port.add_charger(charger1)
     port.add_charger(charger2)
     port.add_pv(pv_system)
+    port.add_bess(bess)
 
     print(f"\nPort: {port}")
     print(f"Boats: {boat1.name}, {boat2.name}")
     print(f"Chargers: {charger1.name}, {charger2.name}")
     print(f"PV: {pv_system}")
+    print(f"BESS: {bess}")
     print(f"\nPort Power Budget:")
     print(f"  Contracted: {port.contracted_power} kW")
     print(f"  PV Capacity: {pv_system.capacity} kW")
-    print(f"  Total (daytime): up to {port.contracted_power + pv_system.capacity} kW")
+    print(f"  BESS Capacity: {bess.capacity} kWh")
+    print(
+        f"  BESS Power: {bess.max_discharge_power} kW (discharge) / {bess.max_charge_power} kW (charge)"
+    )
+    print(f"\nControl Strategy: {bess.control_strategy.value}")
+    print(f"  - Charge from excess solar")
+    print(f"  - Discharge when power needed")
+    print(f"  - SOC limits: {bess.soc_min*100:.0f}% - {bess.soc_max*100:.0f}%")
 
     # Configure simulation
     settings = Settings(
         timestep=900,  # 15 minutes
         mode=SimulationMode.BATCH,
-        db_path="pv_scenario.db",
+        db_path="bess_scenario.db",
     )
 
     # Initialize database
@@ -121,11 +143,47 @@ def run_pv_scenario():
         print(f"  Peak Power: {max_power:.2f} kW")
         print(f"  Capacity Factor: {(avg_power / pv_system.capacity) * 100:.1f}%")
 
+    # Get BESS data
+    bess_soc = db_manager.get_measurements(source=bess.name, metric="soc")
+    bess_power = db_manager.get_measurements(source=bess.name, metric="power")
+    if bess_soc and bess_power:
+        print(f"\nBESS Summary:")
+        soc_values = [row["value"] for row in bess_soc]
+        power_values = [row["value"] for row in bess_power]
+
+        initial_soc = soc_values[0]
+        final_soc = soc_values[-1]
+        min_soc = min(soc_values)
+        max_soc = max(soc_values)
+
+        # Calculate energy charged and discharged
+        charge_energy = sum(
+            p * (settings.timestep / 3600) for p in power_values if p > 0
+        )
+        discharge_energy = sum(
+            -p * (settings.timestep / 3600) for p in power_values if p < 0
+        )
+
+        print(f"  Initial SOC: {initial_soc:.1f}%")
+        print(f"  Final SOC: {final_soc:.1f}%")
+        print(f"  SOC Range: {min_soc:.1f}% - {max_soc:.1f}%")
+        print(f"  Energy Charged: {charge_energy:.2f} kWh")
+        print(f"  Energy Discharged: {discharge_energy:.2f} kWh")
+        print(
+            f"  Net Energy: {(final_soc - initial_soc) * bess.capacity / 100:.2f} kWh"
+        )
+
     # Get port power data
     port_power = db_manager.get_measurements(source="port", metric="pv_production")
+    bess_discharge_data = db_manager.get_measurements(
+        source="port", metric="bess_discharge"
+    )
+    bess_charge_data = db_manager.get_measurements(source="port", metric="bess_charge")
+
     if port_power:
         print(f"\nPort Power Summary:")
-        # Get contracted power usage
+
+        # Get charger load
         used_data = db_manager.get_measurements(
             source="port", metric="total_power_used"
         )
@@ -133,38 +191,67 @@ def run_pv_scenario():
             used_values = [row["value"] for row in used_data]
             avg_used = sum(used_values) / len(used_values)
             max_used = max(used_values)
+            total_used_energy = sum(used_values) * (settings.timestep / 3600)
             print(f"  Avg Charger Load: {avg_used:.2f} kW")
             print(f"  Peak Charger Load: {max_used:.2f} kW")
+            print(f"  Total Energy Used: {total_used_energy:.2f} kWh")
 
-        # Calculate grid vs solar split
+        # Calculate energy sources
         pv_values = [row["value"] for row in port_power]
         total_pv_energy = sum(pv_values) * (settings.timestep / 3600)
-        total_used_energy = sum(used_values) * (settings.timestep / 3600)
-        grid_energy = max(0, total_used_energy - total_pv_energy)
+
+        bess_discharge_values = [row["value"] for row in bess_discharge_data]
+        total_bess_discharge_energy = sum(bess_discharge_values) * (
+            settings.timestep / 3600
+        )
+
+        grid_energy = max(
+            0, total_used_energy - total_pv_energy - total_bess_discharge_energy
+        )
 
         print(f"\nEnergy Sources:")
         print(
-            f"  Solar: {total_pv_energy:.2f} kWh ({(total_pv_energy/max(total_used_energy, 0.1))*100:.1f}%)"
+            f"  Solar (PV): {total_pv_energy:.2f} kWh ({(total_pv_energy/max(total_used_energy, 0.1))*100:.1f}%)"
+        )
+        print(
+            f"  Battery (BESS): {total_bess_discharge_energy:.2f} kWh ({(total_bess_discharge_energy/max(total_used_energy, 0.1))*100:.1f}%)"
         )
         print(
             f"  Grid: {grid_energy:.2f} kWh ({(grid_energy/max(total_used_energy, 0.1))*100:.1f}%)"
         )
+        print(f"  ───────────────────────")
         print(f"  Total Used: {total_used_energy:.2f} kWh")
+
+        renewable_pct = (
+            (total_pv_energy + total_bess_discharge_energy)
+            / max(total_used_energy, 0.1)
+        ) * 100
+        print(f"\n  🌱 Renewable Energy: {renewable_pct:.1f}%")
 
     # Show sample weather data
     weather_data = db_manager.get_forecasts(source="openmeteo", metric="ghi")
     if weather_data:
-        print(f"\nWeather Forecast Loaded:")
-        print(f"  {len(weather_data)} hours of data")
+        print(f"\nWeather Forecast:")
+        print(f"  {len(weather_data)} hours of data loaded")
         # Show midday irradiance
         noon_data = [row for row in weather_data if "12:00:00" in row["timestamp"]]
         if noon_data:
             print(f"  Midday GHI: {noon_data[0]['value']:.0f} W/m²")
 
     print("\n" + "=" * 60)
+    print("BENEFITS OF BESS:")
+    print("=" * 60)
+    print("✓ Stores excess solar during peak production")
+    print("✓ Provides power when solar is unavailable (night)")
+    print("✓ Increases renewable energy self-consumption")
+    print("✓ Reduces grid dependency")
+    print("✓ Helps avoid power demand peaks")
+
+    print("\n" + "=" * 60)
     print(f"✓ Results saved to: {settings.db_path}")
+    print(f"✓ View data using: streamlit run streamlit_app.py")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    run_pv_scenario()
+    run_bess_scenario()

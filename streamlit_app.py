@@ -107,7 +107,6 @@ def main():
         selected_sources = st.multiselect(
             "Sources",
             sources,
-            default=sources[:min(3, len(sources))],
             help="Select one or more sources to display"
         )
 
@@ -115,7 +114,6 @@ def main():
         selected_metrics = st.multiselect(
             "Metrics",
             metrics,
-            default=metrics[:min(1, len(metrics))],
             help="Select one or more metrics to display"
         )
 

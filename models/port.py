@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from .boat import Boat
     from .charger import Charger
     from .pv import PV
+    from .bess import BESS
 
 
 @dataclass
@@ -22,6 +23,7 @@ class Port:
         boats: List of boats at this port
         chargers: List of chargers at this port
         pv_systems: List of PV systems at this port
+        bess_systems: List of BESS (battery storage) systems at this port
     """
 
     name: str
@@ -31,6 +33,7 @@ class Port:
     boats: List["Boat"] = field(default_factory=list)
     chargers: List["Charger"] = field(default_factory=list)
     pv_systems: List["PV"] = field(default_factory=list)
+    bess_systems: List["BESS"] = field(default_factory=list)
 
     def __post_init__(self):
         """Validate port attributes."""
@@ -53,10 +56,14 @@ class Port:
         """Add a PV system to the port."""
         self.pv_systems.append(pv)
 
+    def add_bess(self, bess: "BESS") -> None:
+        """Add a BESS to the port."""
+        self.bess_systems.append(bess)
+
     def __repr__(self) -> str:
         return (
             f"Port(name='{self.name}', contracted_power={self.contracted_power}kW, "
             f"coordinates=({self.lat}, {self.lon}), "
             f"boats={len(self.boats)}, chargers={len(self.chargers)}, "
-            f"pv={len(self.pv_systems)})"
+            f"pv={len(self.pv_systems)}, bess={len(self.bess_systems)})"
         )

@@ -1,6 +1,6 @@
 """Real-time simulation demo: Quick 1-hour test."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from models import Port, Boat, Charger
 from config import Settings, SimulationMode
 from database import DatabaseManager
@@ -64,7 +64,7 @@ def run_realtime_demo():
     print("Press Ctrl+C to stop early if needed.\n")
 
     # Get current time for start
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     start_hour = datetime(now.year, now.month, now.day, now.hour, 0, 0)
 
     sim = SimulationEngine(

@@ -3,6 +3,7 @@
 from models import Port, Boat, BoatState, Charger, ChargerState
 from config import Settings, SimulationMode
 from database import DatabaseManager
+from datetime import datetime, timezone
 
 
 def main():
@@ -96,8 +97,7 @@ def main():
     print("Example: Saving measurements to database (UTC timestamps)")
     print("=" * 50)
 
-    from datetime import datetime
-    current_timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    current_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     # Save measurements using batch insert (with UTC timestamp strings)
     sample_measurements = [

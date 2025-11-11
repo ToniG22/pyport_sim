@@ -15,13 +15,13 @@ def run_simple_scenario():
     # Create port
     port = Port(
         name="Marina del Sol",
-        contracted_power=100,  # 100 kW
+        contracted_power=40,  # 40 kW
         lat=32.64542,
         lon=-16.90841,
     )
 
     # Create 1 boat (starting at 30% charge)
-    boat = Boat(
+    boat1 = Boat(
         name="SeaBreeze",
         motor_power=120,  # kW
         weight=2500,  # kg
@@ -43,7 +43,7 @@ def run_simple_scenario():
     )
 
     # Create 1 charger
-    charger = Charger(
+    charger1 = Charger(
         name="FastCharger_A",
         max_power=22,  # kW
         efficiency=0.95,  # 95% efficient
@@ -55,15 +55,15 @@ def run_simple_scenario():
     )
 
     # Add boats and charger to port
-    port.add_boat(boat)
+    port.add_boat(boat1)
     port.add_boat(boat2)
-    port.add_charger(charger)
+    port.add_charger(charger1)
     port.add_charger(charger2)
 
     print(f"\nPort: {port}")
-    print(f"Boat: {boat}")
-    print(f"  - K-factor: {boat.k:.4f}")
-    print(f"Charger: {charger}")
+    print(f"Boat: {boat1}")
+    print(f"  - K-factor: {boat1.k:.4f}")
+    print(f"Charger: {charger1}")
 
     # Configure simulation settings
     settings = Settings(
@@ -93,7 +93,7 @@ def run_simple_scenario():
     print("=" * 60)
 
     # Get boat SOC over time
-    boat_soc_data = db_manager.get_measurements(source=boat.name, metric="soc")
+    boat_soc_data = db_manager.get_measurements(source=boat1.name, metric="soc")
     print("\nBoat SOC progression (first 10 and last 10 readings):")
     for row in boat_soc_data[:10]:
         print(f"  {row['timestamp']}: SOC={row['value']:5.1f}%")
@@ -115,7 +115,7 @@ def run_simple_scenario():
 
     # Get charger activity
     charger_state_data = db_manager.get_measurements(
-        source=charger.name, metric="state"
+        source=charger1.name, metric="state"
     )
     if charger_state_data:
         charging_count = sum(1 for row in charger_state_data if row["value"] == 1.0)
