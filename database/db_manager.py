@@ -223,3 +223,85 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return cursor.fetchall()
+
+    def save_forecast(self, timestamp: str, source: str, metric: str, value: float):
+        """
+        Save a single forecast to the database.
+
+        Args:
+            timestamp: Forecast timestamp (ISO format UTC string)
+            source: Source identifier (e.g., 'weather', 'pv_forecast')
+            metric: Metric name (e.g., 'temperature', 'ghi', 'dni')
+            value: Forecast value
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO forecast (timestamp, source, metric, value)
+                VALUES (?, ?, ?, ?)
+            """,
+                (timestamp, source, metric, value),
+            )
+
+    def save_forecasts_batch(self, forecasts: list):
+        """
+        Save multiple forecasts in a single transaction.
+
+        Args:
+            forecasts: List of tuples (timestamp, source, metric, value)
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                """
+                INSERT INTO forecast (timestamp, source, metric, value)
+                VALUES (?, ?, ?, ?)
+            """,
+                forecasts,
+            )
+
+    def get_forecasts(
+        self,
+        source: str = None,
+        metric: str = None,
+        start_time: str = None,
+        end_time: str = None,
+    ):
+        """
+        Retrieve forecasts with optional filtering.
+
+        Args:
+            source: Filter by source (optional)
+            metric: Filter by metric (optional)
+            start_time: Filter by start timestamp ISO string (optional)
+            end_time: Filter by end timestamp ISO string (optional)
+
+        Returns:
+            List of forecast records
+        """
+        query = "SELECT * FROM forecast WHERE 1=1"
+        params = []
+
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+
+        if metric:
+            query += " AND metric = ?"
+            params.append(metric)
+
+        if start_time is not None:
+            query += " AND timestamp >= ?"
+            params.append(start_time)
+
+        if end_time is not None:
+            query += " AND timestamp <= ?"
+            params.append(end_time)
+
+        query += " ORDER BY timestamp"
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return cursor.fetchall()

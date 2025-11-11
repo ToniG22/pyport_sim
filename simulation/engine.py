@@ -8,6 +8,7 @@ from models import Port, BoatState, ChargerState, Trip
 from database import DatabaseManager
 from config import Settings, SimulationMode
 from simulation.trip_manager import TripManager
+from weather import OpenMeteoClient
 
 
 class SimulationEngine:
@@ -71,6 +72,16 @@ class SimulationEngine:
 
         # Track last date we assigned trips (to assign at midnight)
         self.last_assignment_date: Optional[str] = None
+
+        # Initialize weather client and fetch forecast if PV systems present
+        self.weather_client = None
+        self.weather_forecast = {}  # {timestamp_str: {metric: value}}
+        self.forecast_loaded = False
+
+        if self.port.pv_systems:
+            print(f"\nInitializing weather data for {len(self.port.pv_systems)} PV system(s)...")
+            self.weather_client = OpenMeteoClient(self.port.lat, self.port.lon)
+            self._load_weather_forecast()
 
     def run(self):
         """Run the simulation based on the configured mode."""
@@ -148,16 +159,19 @@ class SimulationEngine:
         # 0. Assign daily trips at midnight (00:00)
         self._assign_daily_trips_if_midnight()
 
-        # 1. Check and handle trip schedules
+        # 1. Update PV production based on weather
+        self._update_pv_production()
+
+        # 2. Check and handle trip schedules
         self._handle_trips()
 
-        # 2. Check which boats need charging and assign to chargers
+        # 3. Check which boats need charging and assign to chargers
         self._assign_boats_to_chargers()
 
-        # 3. Update charging for boats
+        # 4. Update charging for boats
         self._update_charging()
 
-        # 4. Save measurements to database
+        # 5. Save measurements to database
         self._save_measurements()
 
     def _assign_daily_trips_if_midnight(self):
@@ -300,11 +314,12 @@ class SimulationEngine:
             c for c in self.port.chargers if c.state == ChargerState.IDLE
         ]
 
-        # Calculate available power at port
+        # Calculate available power at port (including PV production)
         used_power = sum(
             c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
         )
-        available_power = self.port.contracted_power - used_power
+        pv_production = sum(pv.current_production for pv in self.port.pv_systems)
+        available_power = self.port.contracted_power + pv_production - used_power
 
         # Assign boats to chargers
         for boat in boats_needing_charge:
@@ -354,6 +369,91 @@ class SimulationEngine:
                 charger.connected_boat = None
                 del self.boat_charger_map[boat_name]
 
+    def _load_weather_forecast(self):
+        """Load weather forecast from Open-Meteo and save to database."""
+        if not self.weather_client:
+            return
+
+        print("  Fetching weather forecast from Open-Meteo...")
+        forecast_data = self.weather_client.fetch_forecast(self.start_date, self.days)
+
+        if not forecast_data or "timestamps" not in forecast_data:
+            print("  ⚠️  Failed to fetch weather forecast")
+            return
+
+        timestamps = forecast_data["timestamps"]
+        print(f"  ✓ Received {len(timestamps)} hours of forecast data")
+
+        # Save to database
+        forecasts = []
+        for i, ts in enumerate(timestamps):
+            ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+
+            # Save each metric
+            for metric, values in forecast_data.items():
+                if metric == "timestamps":
+                    continue
+
+                if i < len(values) and values[i] is not None:
+                    forecasts.append((ts_str, "openmeteo", metric, float(values[i])))
+
+            # Store in memory for quick access
+            if i < len(values):
+                self.weather_forecast[ts_str] = {}
+                for metric, values in forecast_data.items():
+                    if metric != "timestamps" and i < len(values) and values[i] is not None:
+                        self.weather_forecast[ts_str][metric] = float(values[i])
+
+        # Save to database
+        if forecasts:
+            self.db_manager.save_forecasts_batch(forecasts)
+            print(f"  ✓ Saved {len(forecasts)} forecast values to database")
+
+        self.forecast_loaded = True
+
+    def _get_weather_conditions(self, timestamp: datetime) -> Dict:
+        """
+        Get weather conditions for a specific timestamp.
+
+        Args:
+            timestamp: Datetime to get conditions for
+
+        Returns:
+            Dictionary with weather metrics
+        """
+        # Round to nearest hour for lookup
+        rounded = timestamp.replace(minute=0, second=0, microsecond=0)
+        ts_str = rounded.strftime("%Y-%m-%d %H:%M:%S")
+
+        if ts_str in self.weather_forecast:
+            return self.weather_forecast[ts_str]
+
+        # Return default values if not found
+        return {
+            "ghi": 0.0,
+            "dni": 0.0,
+            "dhi": 0.0,
+            "temperature": 20.0,
+        }
+
+    def _update_pv_production(self):
+        """Update PV production for all PV systems."""
+        if not self.port.pv_systems:
+            return
+
+        # Get current weather conditions
+        conditions = self._get_weather_conditions(self.current_datetime)
+
+        # Update each PV system
+        for pv in self.port.pv_systems:
+            pv.calculate_production(
+                ghi=conditions.get("ghi", 0.0),
+                dni=conditions.get("dni", 0.0),
+                dhi=conditions.get("dhi", 0.0),
+                temperature=conditions.get("temperature", 20.0),
+                timestamp=self.current_datetime,
+            )
+
     def _save_measurements(self):
         """Save current state to database."""
         measurements = []
@@ -361,15 +461,23 @@ class SimulationEngine:
         # Convert current datetime to ISO format string (UTC)
         timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
 
+        # Calculate PV production
+        total_pv_production = sum(pv.current_production for pv in self.port.pv_systems)
+
         # Calculate port metrics
         total_power_used = sum(
             c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
         )
-        available_power = self.port.contracted_power - total_power_used
+        
+        # Available power = contracted power + PV production - power used
+        available_power = self.port.contracted_power + total_pv_production - total_power_used
 
         # Port measurements
         measurements.append(
             (timestamp_str, "port", "total_power_used", total_power_used)
+        )
+        measurements.append(
+            (timestamp_str, "port", "pv_production", total_pv_production)
         )
         measurements.append((timestamp_str, "port", "available_power", available_power))
         measurements.append(
@@ -412,6 +520,12 @@ class SimulationEngine:
                     "state",
                     float(charger.state.value == "charging"),
                 )
+            )
+
+        # PV system measurements
+        for pv in self.port.pv_systems:
+            measurements.append(
+                (timestamp_str, pv.name, "production", pv.current_production)
             )
 
         # Save to database
