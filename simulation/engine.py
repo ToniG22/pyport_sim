@@ -70,6 +70,9 @@ class SimulationEngine:
         # Track active trips: {boat_name: (trip, start_datetime, elapsed_seconds)}
         self.active_trips: Dict[str, tuple[Trip, datetime, float]] = {}
 
+        # Track delayed trips (boats waiting for sufficient SOC): {boat_name: trip}
+        self.delayed_trips: Dict[str, Trip] = {}
+
         # Track last date we assigned trips (to assign at midnight)
         self.last_assignment_date: Optional[str] = None
 
@@ -164,14 +167,14 @@ class SimulationEngine:
         # 1. Update PV production based on weather
         self._update_pv_production()
 
-        # 2. Update BESS (default control strategy)
-        self._update_bess()
-
-        # 3. Check and handle trip schedules
+        # 2. Check and handle trip schedules
         self._handle_trips()
 
-        # 4. Check which boats need charging and assign to chargers
+        # 3. Check which boats need charging and assign to chargers
         self._assign_boats_to_chargers()
+
+        # 4. Update BESS (after charger assignment to see correct load)
+        self._update_bess()
 
         # 5. Update charging for boats
         self._update_charging()
@@ -186,6 +189,11 @@ class SimulationEngine:
         # Check if it's midnight and we haven't assigned for this date yet
         if self.current_datetime.hour == 0 and self.current_datetime.minute == 0:
             if self.last_assignment_date != current_date_str:
+                # Clear any delayed trips from previous day
+                if self.delayed_trips:
+                    print(f"\n  🗑️  Clearing {len(self.delayed_trips)} delayed trip(s) from previous day")
+                    self.delayed_trips.clear()
+                
                 print(f"\n  📅 Assigning trips for {current_date_str}")
                 weekday_name = self.current_datetime.strftime("%A")
                 print(f"     Day: {weekday_name}")
@@ -232,6 +240,50 @@ class SimulationEngine:
                     self.active_trips[boat_name] = (trip, start_time, elapsed)
                 continue
 
+            # Check for delayed trips (boats waiting for sufficient charge)
+            if boat_name in self.delayed_trips:
+                trip = self.delayed_trips[boat_name]
+                
+                # Don't start trips after 6 PM (18:00)
+                if current_hour >= 18:
+                    # Cancel delayed trip if it's past 6 PM
+                    if current_hour == 18 and current_minute < (self.settings.timestep / 60):
+                        print(
+                            f"  ❌ {boat.name} cancelled DELAYED {trip.route_name} - too late (after 6 PM)"
+                        )
+                        del self.delayed_trips[boat_name]
+                    continue
+                
+                estimated_energy = trip.estimate_energy_required(boat.k)
+                required_soc = estimated_energy / boat.battery_capacity
+
+                # Check if boat now has enough charge
+                if boat.soc >= required_soc:
+                    # Disconnect from charger if connected
+                    if boat_name in self.boat_charger_map:
+                        charger_name = self.boat_charger_map[boat_name]
+                        charger = next(
+                            c for c in self.port.chargers if c.name == charger_name
+                        )
+                        charger.state = ChargerState.IDLE
+                        charger.power = 0.0
+                        charger.connected_boat = None
+                        del self.boat_charger_map[boat_name]
+
+                    # Start delayed trip
+                    self.active_trips[boat_name] = (
+                        trip,
+                        self.current_datetime,
+                        0.0,
+                    )
+                    boat.state = BoatState.SAILING
+                    print(
+                        f"  → {boat.name} starting DELAYED {trip.route_name} at {self.current_datetime.strftime('%H:%M')}, "
+                        f"SOC={boat.soc:.1%} (needed {required_soc:.1%})"
+                    )
+                    del self.delayed_trips[boat_name]
+                continue
+
             # Check if it's time to start a new trip
             for start_hour, slot in self.trip_schedule:
                 # Start trip at the scheduled hour (check within the timestep window)
@@ -276,10 +328,13 @@ class SimulationEngine:
                         )
                         break
                     else:
+                        # Not enough charge - delay the trip
+                        self.delayed_trips[boat_name] = trip
                         print(
-                            f"  ⚠️  {boat.name} cannot start {trip.route_name} - insufficient charge "
-                            f"(has {boat.soc:.1%}, needs {required_soc:.1%})"
+                            f"  ⏸️  {boat.name} delaying {trip.route_name} - insufficient charge "
+                            f"(has {boat.soc:.1%}, needs {required_soc:.1%}). Will depart when ready."
                         )
+                        break
 
     def _discharge_boat_on_trip(self, boat, trip: Trip, elapsed_seconds: float):
         """Discharge boat battery during trip based on CSV speed data."""
@@ -331,6 +386,12 @@ class SimulationEngine:
             for bess in self.port.bess_systems
             if bess.current_power < 0
         )
+        
+        # Calculate potential BESS discharge capacity (what BESS COULD provide)
+        potential_bess_discharge = sum(
+            bess.get_max_discharge_power_available(self.settings.timestep)
+            for bess in self.port.bess_systems
+        )
 
         available_power = (
             self.port.contracted_power + pv_production + bess_discharge - used_power
@@ -344,7 +405,18 @@ class SimulationEngine:
             charger = available_chargers.pop(0)
 
             # Check if we have enough power to run this charger at max
-            if available_power >= charger.max_power:
+            # If not enough immediate power, check if BESS can cover the deficit
+            power_needed = charger.max_power
+            
+            if available_power >= power_needed:
+                # Sufficient power available directly
+                can_assign = True
+            else:
+                # Not enough power - check if BESS can cover the deficit
+                deficit = power_needed - available_power
+                can_assign = potential_bess_discharge >= deficit
+            
+            if can_assign:
                 # Assign boat to charger
                 self.boat_charger_map[boat.name] = charger.name
                 boat.state = BoatState.CHARGING
@@ -352,6 +424,11 @@ class SimulationEngine:
                 charger.power = charger.max_power
                 charger.connected_boat = boat.name
                 available_power -= charger.max_power
+                
+                # Reduce potential BESS discharge if we're counting on it
+                if available_power < 0:
+                    potential_bess_discharge -= abs(available_power)
+                    available_power = 0
 
                 # Log charging start
                 if self.current_datetime.minute % 15 == 0:
