@@ -9,6 +9,9 @@ requests>=2.31.0
 streamlit>=1.28.0
 pandas>=2.0.0
 
+# Optimization
+pyscipopt>=5.0.0
+
 # Future dependencies (uncomment as needed):
 # numpy>=1.24.0
 # matplotlib>=3.7.0  # for visualization

@@ -120,4 +120,27 @@ class TripManager:
             return trips[slot]
 
         return None
+    
+    def get_trips_for_date(
+        self, boat_name: str, current_date: datetime
+    ) -> List[Trip]:
+        """
+        Get all assigned trips for a boat on a specific date.
+        
+        Args:
+            boat_name: Name of the boat
+            current_date: Date to get trips for
+            
+        Returns:
+            List of trips assigned for this date (may be empty)
+        """
+        date_str = current_date.strftime("%Y-%m-%d")
+        
+        if boat_name not in self.daily_assignments:
+            return []
+        
+        if date_str not in self.daily_assignments[boat_name]:
+            return []
+        
+        return self.daily_assignments[boat_name][date_str]
 

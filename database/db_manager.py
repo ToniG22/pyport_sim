@@ -305,3 +305,99 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return cursor.fetchall()
+    
+    def save_schedule(self, timestamp: str, source: str, metric: str, value: float):
+        """
+        Save a single schedule entry to the database.
+        
+        Args:
+            timestamp: Schedule timestamp (ISO format UTC string)
+            source: Source identifier (e.g., 'FastCharger_A', 'Battery_Storage_1')
+            metric: Metric/command name (e.g., 'power_setpoint', 'charge_command')
+            value: Scheduled value
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO scheduling (timestamp, source, metric, value)
+                VALUES (?, ?, ?, ?)
+            """,
+                (timestamp, source, metric, value),
+            )
+    
+    def save_schedules_batch(self, schedules: list):
+        """
+        Save multiple schedules in a single transaction.
+        
+        Args:
+            schedules: List of tuples (timestamp, source, metric, value)
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                """
+                INSERT INTO scheduling (timestamp, source, metric, value)
+                VALUES (?, ?, ?, ?)
+            """,
+                schedules,
+            )
+    
+    def get_schedules(
+        self,
+        source: str = None,
+        metric: str = None,
+        start_time: str = None,
+        end_time: str = None,
+    ):
+        """
+        Retrieve schedules from the database with optional filtering.
+        
+        Args:
+            source: Filter by source (e.g., 'FastCharger_A')
+            metric: Filter by metric (e.g., 'power_setpoint')
+            start_time: Start timestamp (inclusive)
+            end_time: End timestamp (inclusive)
+            
+        Returns:
+            List of schedule records
+        """
+        query = "SELECT * FROM scheduling WHERE 1=1"
+        params = []
+        
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        
+        if metric:
+            query += " AND metric = ?"
+            params.append(metric)
+        
+        if start_time is not None:
+            query += " AND timestamp >= ?"
+            params.append(start_time)
+        
+        if end_time is not None:
+            query += " AND timestamp <= ?"
+            params.append(end_time)
+        
+        query += " ORDER BY timestamp"
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return cursor.fetchall()
+    
+    def clear_schedules(self, source: str = None):
+        """
+        Clear scheduling entries from the database.
+        
+        Args:
+            source: Optional source filter (clears only this source if provided)
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if source:
+                cursor.execute("DELETE FROM scheduling WHERE source = ?", (source,))
+            else:
+                cursor.execute("DELETE FROM scheduling")

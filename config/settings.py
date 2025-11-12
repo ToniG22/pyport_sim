@@ -21,11 +21,13 @@ class Settings:
         timestep: Simulation timestep in seconds
         mode: Simulation mode (real-time or batch)
         db_path: Path to SQLite database file
+        use_optimizer: Whether to use SCIP optimization for scheduling
     """
 
-    timestep: int = 900  # Default: 15 minute
+    timestep: int = 900  # Default: 15 minutes
     mode: SimulationMode = SimulationMode.BATCH
     db_path: str = "port_simulation.db"
+    use_optimizer: bool = False  # Default: use rule-based control
 
     def __post_init__(self):
         """Validate settings."""

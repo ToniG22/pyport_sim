@@ -2,13 +2,15 @@
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from models import Port, BoatState, ChargerState, Trip
 from database import DatabaseManager
 from config import Settings, SimulationMode
 from simulation.trip_manager import TripManager
 from weather import OpenMeteoClient
+from forecasting import PortForecaster
+from optimization import PortOptimizer
 
 
 class SimulationEngine:
@@ -75,9 +77,25 @@ class SimulationEngine:
 
         # Track last date we assigned trips (to assign at midnight)
         self.last_assignment_date: Optional[str] = None
-        
+
         # Track last date we fetched weather forecast
         self.last_weather_fetch_date: Optional[str] = None
+        
+        # Track last date we generated energy forecast
+        self.last_energy_forecast_date: Optional[str] = None
+        
+        # Initialize forecaster
+        self.forecaster = PortForecaster(port, db_manager, settings.timestep)
+        
+        # Initialize optimizer (if enabled)
+        self.optimizer = None
+        self.use_optimizer = settings.use_optimizer
+        if self.use_optimizer:
+            self.optimizer = PortOptimizer(port, db_manager, settings.timestep)
+            print(f"\n🔧 Optimizer enabled (SCIP)")
+        
+        # Store latest forecasts for optimizer
+        self.latest_energy_forecasts = []
 
         # Initialize weather client and fetch forecast if PV systems present
         self.weather_client = None
@@ -171,48 +189,160 @@ class SimulationEngine:
         
         # 1. Assign daily trips at midnight (00:00)
         self._assign_daily_trips_if_midnight()
+        
+        # 2. Generate energy forecast at midnight (00:00)
+        self._generate_energy_forecast_if_midnight()
 
-        # 2. Update PV production based on weather
+        # 3. Update PV production based on weather
         self._update_pv_production()
 
-        # 3. Check and handle trip schedules
+        # 4. Check and handle trip schedules
         self._handle_trips()
 
-        # 4. Check which boats need charging and assign to chargers
+        # 5. Check which boats need charging and assign to chargers
         self._assign_boats_to_chargers()
 
-        # 5. Update BESS (after charger assignment to see correct load)
+        # 6. Update BESS (after charger assignment to see correct load)
         self._update_bess()
 
-        # 6. Update charging for boats
+        # 7. Update charging for boats
         self._update_charging()
 
-        # 7. Save measurements to database
+        # 8. Save measurements to database
         self._save_measurements()
 
     def _fetch_weather_if_midnight(self):
         """Fetch weather forecast daily at midnight (00:00)."""
         if not self.weather_client:
             return
-            
+
         current_date_str = self.current_datetime.strftime("%Y-%m-%d")
-        
+
         # Check if it's midnight and we haven't fetched for this date yet
         if self.current_datetime.hour == 0 and self.current_datetime.minute == 0:
             if self.last_weather_fetch_date != current_date_str:
                 print(f"\n  🌤️  Fetching weather forecast for {current_date_str}")
-                
+
                 # Calculate remaining days in simulation from current date
-                days_remaining = (self.start_date + timedelta(days=self.days) - self.current_datetime).days
-                days_to_fetch = min(days_remaining, 7)  # OpenMeteo provides up to 7 days
-                
+                days_remaining = (
+                    self.start_date + timedelta(days=self.days) - self.current_datetime
+                ).days
+                days_to_fetch = min(
+                    days_remaining, 7
+                )  # OpenMeteo provides up to 7 days
+
                 if days_to_fetch > 0:
                     # Fetch forecast from current date
-                    self._load_weather_forecast(start_from=self.current_datetime, days=days_to_fetch)
+                    self._load_weather_forecast(
+                        start_from=self.current_datetime, days=days_to_fetch
+                    )
                     self.last_weather_fetch_date = current_date_str
-                    print(f"     ✓ Weather data updated for next {days_to_fetch} day(s)")
+                    print(
+                        f"     ✓ Weather data updated for next {days_to_fetch} day(s)"
+                    )
                 print()
     
+    def _generate_energy_forecast_if_midnight(self):
+        """Generate energy consumption/production forecast at midnight (00:00)."""
+        current_date_str = self.current_datetime.strftime("%Y-%m-%d")
+        
+        # Check if it's midnight and we haven't forecasted for this date yet
+        if self.current_datetime.hour == 0 and self.current_datetime.minute == 0:
+            if self.last_energy_forecast_date != current_date_str:
+                print(f"  📊 Generating energy forecast for {current_date_str}")
+                
+                # Get trip assignments for today
+                trip_assignments = {}
+                for boat in self.port.boats:
+                    trips = self.trip_manager.get_trips_for_date(
+                        boat.name, self.current_datetime
+                    )
+                    trip_assignments[boat.name] = trips
+                
+                # Generate 24-hour forecast
+                forecasts = self.forecaster.generate_daily_forecast(
+                    self.current_datetime, trip_assignments
+                )
+                
+                # Store forecasts for optimizer
+                self.latest_energy_forecasts = forecasts
+                
+                # Save to database
+                self.forecaster.save_forecasts_to_db(forecasts, forecast_type="port_energy")
+                
+                # Print summary
+                self.forecaster.print_forecast_summary(forecasts)
+                
+                # Run optimization if enabled
+                if self.use_optimizer and self.optimizer:
+                    self._run_optimization(trip_assignments)
+                
+                self.last_energy_forecast_date = current_date_str
+                print()
+    
+    def _run_optimization(self, trip_assignments: Dict[str, List]):
+        """
+        Run optimization to create optimal schedules for chargers and BESS.
+        
+        Args:
+            trip_assignments: Trip assignments per boat
+        """
+        print(f"  🎯 Running optimization...")
+        
+        # Run optimization
+        result = self.optimizer.optimize_daily_schedule(
+            self.current_datetime,
+            self.latest_energy_forecasts,
+            trip_assignments
+        )
+        
+        # Save schedules to database
+        self.optimizer.save_schedules_to_db(result)
+        
+        print(f"     ✓ Schedules saved to database")
+    
+    def _trigger_reoptimization(self):
+        """Trigger re-optimization when boat state changes (arrive/depart)."""
+        current_date_str = self.current_datetime.strftime("%Y-%m-%d")
+        
+        # Only re-optimize during daytime (after 6:00, before 20:00)
+        if self.current_datetime.hour < 6 or self.current_datetime.hour >= 20:
+            return
+        
+        print(f"  🔄 Re-optimizing from {self.current_datetime.strftime('%H:%M')}...")
+        
+        # Clear existing schedules for remaining day
+        for charger in self.port.chargers:
+            self.db_manager.clear_schedules(source=charger.name)
+        for bess in self.port.bess_systems:
+            self.db_manager.clear_schedules(source=bess.name)
+        
+        # Get trip assignments for today (remaining trips)
+        trip_assignments = {}
+        for boat in self.port.boats:
+            trips = self.trip_manager.get_trips_for_date(
+                boat.name, self.current_datetime
+            )
+            trip_assignments[boat.name] = trips
+        
+        # Generate forecast from current time to end of day
+        remaining_forecasts = [
+            f for f in self.latest_energy_forecasts 
+            if f.timestamp >= self.current_datetime
+        ]
+        
+        if remaining_forecasts:
+            # Run optimization with updated boat SOCs
+            result = self.optimizer.optimize_daily_schedule(
+                self.current_datetime,
+                remaining_forecasts,
+                trip_assignments
+            )
+            
+            # Save new schedules
+            self.optimizer.save_schedules_to_db(result)
+            print(f"     ✓ Updated schedules from {self.current_datetime.strftime('%H:%M')} onwards")
+
     def _assign_daily_trips_if_midnight(self):
         """Assign trips for all boats at midnight (00:00)."""
         current_date_str = self.current_datetime.strftime("%Y-%m-%d")
@@ -222,9 +352,11 @@ class SimulationEngine:
             if self.last_assignment_date != current_date_str:
                 # Clear any delayed trips from previous day
                 if self.delayed_trips:
-                    print(f"  🗑️  Clearing {len(self.delayed_trips)} delayed trip(s) from previous day")
+                    print(
+                        f"  🗑️  Clearing {len(self.delayed_trips)} delayed trip(s) from previous day"
+                    )
                     self.delayed_trips.clear()
-                
+
                 print(f"  📅 Assigning trips for {current_date_str}")
                 weekday_name = self.current_datetime.strftime("%A")
                 print(f"     Day: {weekday_name}")
@@ -265,6 +397,10 @@ class SimulationEngine:
                         f"  ← {boat.name} returned from {trip.route_name} at {self.current_datetime.strftime('%H:%M')}, SOC={boat.soc:.1%}"
                     )
                     del self.active_trips[boat_name]
+                    
+                    # Trigger re-optimization if optimizer is enabled
+                    if self.use_optimizer and self.optimizer:
+                        self._trigger_reoptimization()
                 else:
                     # Still on trip, discharge battery based on current speed from CSV
                     self._discharge_boat_on_trip(boat, trip, elapsed)
@@ -274,17 +410,19 @@ class SimulationEngine:
             # Check for delayed trips (boats waiting for sufficient charge)
             if boat_name in self.delayed_trips:
                 trip = self.delayed_trips[boat_name]
-                
+
                 # Don't start trips after 6 PM (18:00)
                 if current_hour >= 18:
                     # Cancel delayed trip if it's past 6 PM
-                    if current_hour == 18 and current_minute < (self.settings.timestep / 60):
+                    if current_hour == 18 and current_minute < (
+                        self.settings.timestep / 60
+                    ):
                         print(
                             f"  ❌ {boat.name} cancelled DELAYED {trip.route_name} - too late (after 6 PM)"
                         )
                         del self.delayed_trips[boat_name]
                     continue
-                
+
                 estimated_energy = trip.estimate_energy_required(boat.k)
                 required_soc = estimated_energy / boat.battery_capacity
 
@@ -313,6 +451,10 @@ class SimulationEngine:
                         f"SOC={boat.soc:.1%} (needed {required_soc:.1%})"
                     )
                     del self.delayed_trips[boat_name]
+                    
+                    # Trigger re-optimization if optimizer is enabled
+                    if self.use_optimizer and self.optimizer:
+                        self._trigger_reoptimization()
                 continue
 
             # Check if it's time to start a new trip
@@ -357,6 +499,11 @@ class SimulationEngine:
                             f"  → {boat.name} starting {trip.route_name} at {self.current_datetime.strftime('%H:%M')}, "
                             f"SOC={boat.soc:.1%} (need {required_soc:.1%})"
                         )
+                        
+                        # Trigger re-optimization if optimizer is enabled
+                        if self.use_optimizer and self.optimizer:
+                            self._trigger_reoptimization()
+                        
                         break
                     else:
                         # Not enough charge - delay the trip
@@ -388,6 +535,64 @@ class SimulationEngine:
 
     def _assign_boats_to_chargers(self):
         """Assign boats that need charging to available chargers."""
+        # Check if we're using optimizer schedules
+        if self.use_optimizer:
+            self._assign_boats_to_chargers_with_schedule()
+        else:
+            self._assign_boats_to_chargers_default()
+    
+    def _assign_boats_to_chargers_with_schedule(self):
+        """Assign boats to chargers using optimized schedules from database."""
+        timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Get charger power setpoints from schedule
+        for charger in self.port.chargers:
+            schedule = self.db_manager.get_schedules(
+                source=charger.name,
+                metric="power_setpoint",
+                start_time=timestamp_str,
+                end_time=timestamp_str
+            )
+            
+            if schedule:
+                # Use scheduled power
+                scheduled_power = schedule[0]['value']
+                
+                if scheduled_power > 0.1 and charger.state == ChargerState.IDLE:
+                    # Find a boat that needs charging
+                    for boat in self.port.boats:
+                        if (boat.state != BoatState.SAILING and 
+                            boat.soc < 0.99 and 
+                            boat.name not in self.boat_charger_map):
+                            
+                            # Assign charger to boat
+                            self.boat_charger_map[boat.name] = charger.name
+                            boat.state = BoatState.CHARGING
+                            charger.state = ChargerState.CHARGING
+                            charger.power = min(scheduled_power, charger.max_power)
+                            charger.connected_boat = boat.name
+                            
+                            if self.current_datetime.minute % 15 == 0:
+                                print(
+                                    f"  ⚡ {boat.name} started charging at {charger.name} (scheduled), SOC={boat.soc:.1%}"
+                                )
+                            break
+                elif scheduled_power < 0.1 and charger.state == ChargerState.CHARGING:
+                    # Schedule says stop charging
+                    if charger.connected_boat in self.boat_charger_map:
+                        boat_name = charger.connected_boat
+                        boat = next(b for b in self.port.boats if b.name == boat_name)
+                        boat.state = BoatState.IDLE
+                        charger.state = ChargerState.IDLE
+                        charger.power = 0.0
+                        charger.connected_boat = None
+                        del self.boat_charger_map[boat_name]
+            else:
+                # No schedule - fallback to default behavior for this charger
+                pass
+    
+    def _assign_boats_to_chargers_default(self):
+        """Assign boats to chargers using default rule-based logic."""
         # Get boats that need charging (not sailing, not fully charged)
         boats_needing_charge = [
             b
@@ -438,7 +643,7 @@ class SimulationEngine:
             # Check if we have enough power to run this charger at max
             # If not enough immediate power, check if BESS can cover the deficit
             power_needed = charger.max_power
-            
+
             if available_power >= power_needed:
                 # Sufficient power available directly
                 can_assign = True
@@ -446,7 +651,7 @@ class SimulationEngine:
                 # Not enough power - check if BESS can cover the deficit
                 deficit = power_needed - available_power
                 can_assign = potential_bess_discharge >= deficit
-            
+
             if can_assign:
                 # Assign boat to charger
                 self.boat_charger_map[boat.name] = charger.name
@@ -492,9 +697,11 @@ class SimulationEngine:
                 charger.connected_boat = None
                 del self.boat_charger_map[boat_name]
 
-    def _load_weather_forecast(self, start_from: Optional[datetime] = None, days: Optional[int] = None):
+    def _load_weather_forecast(
+        self, start_from: Optional[datetime] = None, days: Optional[int] = None
+    ):
         """Load weather forecast from Open-Meteo and save to database.
-        
+
         Args:
             start_from: Starting date for forecast (default: simulation start_date)
             days: Number of days to fetch (default: simulation days, max 7)
@@ -591,17 +798,47 @@ class SimulationEngine:
             )
 
     def _update_bess(self):
-        """
-        Update BESS charge/discharge based on default control strategy.
-
-        Default strategy:
-        - Charge from surplus PV production (when PV > charger load)
-        - Discharge when needed (when contracted + PV < charger load)
-        - Respect SOC limits (10% min, 90% max by default)
-        """
+        """Update BESS charge/discharge."""
         if not self.port.bess_systems:
             return
-
+        
+        # Check if we're using optimizer schedules
+        if self.use_optimizer:
+            self._update_bess_with_schedule()
+        else:
+            self._update_bess_default()
+    
+    def _update_bess_with_schedule(self):
+        """Update BESS using optimized schedules from database."""
+        timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        
+        for bess in self.port.bess_systems:
+            schedule = self.db_manager.get_schedules(
+                source=bess.name,
+                metric="power_setpoint",
+                start_time=timestamp_str,
+                end_time=timestamp_str
+            )
+            
+            if schedule:
+                # Use scheduled power (positive = discharge, negative = charge)
+                scheduled_power = schedule[0]['value']
+                
+                if scheduled_power > 0.1:
+                    # Discharge
+                    bess.discharge(scheduled_power, self.settings.timestep)
+                elif scheduled_power < -0.1:
+                    # Charge
+                    bess.charge(abs(scheduled_power), self.settings.timestep)
+                else:
+                    # Idle
+                    bess.idle()
+            else:
+                # No schedule - fallback to default
+                bess.idle()
+    
+    def _update_bess_default(self):
+        """Update BESS using default control strategy."""
         # Calculate current power flows
         pv_production = sum(pv.current_production for pv in self.port.pv_systems)
         charger_load = sum(
@@ -676,10 +913,10 @@ class SimulationEngine:
 
         # Port measurements
         measurements.append(
-            (timestamp_str, "port", "total_power_used", total_power_used)
+            (timestamp_str, "port", "power_active_consumption", total_power_used)
         )
         measurements.append(
-            (timestamp_str, "port", "pv_production", total_pv_production)
+            (timestamp_str, "port", "power_active_production", total_pv_production)
         )
         measurements.append((timestamp_str, "port", "bess_discharge", bess_discharge))
         measurements.append((timestamp_str, "port", "bess_charge", bess_charge))
@@ -712,11 +949,13 @@ class SimulationEngine:
                 # Motor is off when charging or idle
                 motor_power = 0.0
 
-            measurements.append((timestamp_str, boat.name, "power", motor_power))
+            measurements.append((timestamp_str, boat.name, "power_active", motor_power))
 
         # Charger measurements
         for charger in self.port.chargers:
-            measurements.append((timestamp_str, charger.name, "power", charger.power))
+            measurements.append(
+                (timestamp_str, charger.name, "power_active", charger.power)
+            )
             measurements.append(
                 (
                     timestamp_str,
@@ -729,7 +968,12 @@ class SimulationEngine:
         # PV system measurements
         for pv in self.port.pv_systems:
             measurements.append(
-                (timestamp_str, pv.name, "production", pv.current_production)
+                (
+                    timestamp_str,
+                    pv.name,
+                    "power_active_production",
+                    pv.current_production,
+                )
             )
 
         # BESS measurements
@@ -737,7 +981,9 @@ class SimulationEngine:
             measurements.append(
                 (timestamp_str, bess.name, "soc", bess.current_soc * 100)
             )
-            measurements.append((timestamp_str, bess.name, "power", bess.current_power))
+            measurements.append(
+                (timestamp_str, bess.name, "power_active", bess.current_power)
+            )
             measurements.append(
                 (timestamp_str, bess.name, "energy_stored", bess.get_energy_stored())
             )
