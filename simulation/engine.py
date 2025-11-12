@@ -75,6 +75,9 @@ class SimulationEngine:
 
         # Track last date we assigned trips (to assign at midnight)
         self.last_assignment_date: Optional[str] = None
+        
+        # Track last date we fetched weather forecast
+        self.last_weather_fetch_date: Optional[str] = None
 
         # Initialize weather client and fetch forecast if PV systems present
         self.weather_client = None
@@ -87,6 +90,8 @@ class SimulationEngine:
             )
             self.weather_client = OpenMeteoClient(self.port.lat, self.port.lon)
             self._load_weather_forecast()
+            # Mark initial fetch date
+            self.last_weather_fetch_date = self.start_date.strftime("%Y-%m-%d")
 
     def run(self):
         """Run the simulation based on the configured mode."""
@@ -161,27 +166,53 @@ class SimulationEngine:
 
     def _simulate_timestep(self):
         """Simulate a single timestep."""
-        # 0. Assign daily trips at midnight (00:00)
+        # 0. Fetch weather forecast daily at midnight (00:00)
+        self._fetch_weather_if_midnight()
+        
+        # 1. Assign daily trips at midnight (00:00)
         self._assign_daily_trips_if_midnight()
 
-        # 1. Update PV production based on weather
+        # 2. Update PV production based on weather
         self._update_pv_production()
 
-        # 2. Check and handle trip schedules
+        # 3. Check and handle trip schedules
         self._handle_trips()
 
-        # 3. Check which boats need charging and assign to chargers
+        # 4. Check which boats need charging and assign to chargers
         self._assign_boats_to_chargers()
 
-        # 4. Update BESS (after charger assignment to see correct load)
+        # 5. Update BESS (after charger assignment to see correct load)
         self._update_bess()
 
-        # 5. Update charging for boats
+        # 6. Update charging for boats
         self._update_charging()
 
-        # 6. Save measurements to database
+        # 7. Save measurements to database
         self._save_measurements()
 
+    def _fetch_weather_if_midnight(self):
+        """Fetch weather forecast daily at midnight (00:00)."""
+        if not self.weather_client:
+            return
+            
+        current_date_str = self.current_datetime.strftime("%Y-%m-%d")
+        
+        # Check if it's midnight and we haven't fetched for this date yet
+        if self.current_datetime.hour == 0 and self.current_datetime.minute == 0:
+            if self.last_weather_fetch_date != current_date_str:
+                print(f"\n  🌤️  Fetching weather forecast for {current_date_str}")
+                
+                # Calculate remaining days in simulation from current date
+                days_remaining = (self.start_date + timedelta(days=self.days) - self.current_datetime).days
+                days_to_fetch = min(days_remaining, 7)  # OpenMeteo provides up to 7 days
+                
+                if days_to_fetch > 0:
+                    # Fetch forecast from current date
+                    self._load_weather_forecast(start_from=self.current_datetime, days=days_to_fetch)
+                    self.last_weather_fetch_date = current_date_str
+                    print(f"     ✓ Weather data updated for next {days_to_fetch} day(s)")
+                print()
+    
     def _assign_daily_trips_if_midnight(self):
         """Assign trips for all boats at midnight (00:00)."""
         current_date_str = self.current_datetime.strftime("%Y-%m-%d")
@@ -191,10 +222,10 @@ class SimulationEngine:
             if self.last_assignment_date != current_date_str:
                 # Clear any delayed trips from previous day
                 if self.delayed_trips:
-                    print(f"\n  🗑️  Clearing {len(self.delayed_trips)} delayed trip(s) from previous day")
+                    print(f"  🗑️  Clearing {len(self.delayed_trips)} delayed trip(s) from previous day")
                     self.delayed_trips.clear()
                 
-                print(f"\n  📅 Assigning trips for {current_date_str}")
+                print(f"  📅 Assigning trips for {current_date_str}")
                 weekday_name = self.current_datetime.strftime("%A")
                 print(f"     Day: {weekday_name}")
 
@@ -461,13 +492,22 @@ class SimulationEngine:
                 charger.connected_boat = None
                 del self.boat_charger_map[boat_name]
 
-    def _load_weather_forecast(self):
-        """Load weather forecast from Open-Meteo and save to database."""
+    def _load_weather_forecast(self, start_from: Optional[datetime] = None, days: Optional[int] = None):
+        """Load weather forecast from Open-Meteo and save to database.
+        
+        Args:
+            start_from: Starting date for forecast (default: simulation start_date)
+            days: Number of days to fetch (default: simulation days, max 7)
+        """
         if not self.weather_client:
             return
 
+        # Use provided values or defaults
+        fetch_start = start_from if start_from else self.start_date
+        fetch_days = min(days if days else self.days, 7)  # Cap at 7 days
+
         print("  Fetching weather forecast from Open-Meteo...")
-        forecast_data = self.weather_client.fetch_forecast(self.start_date, self.days)
+        forecast_data = self.weather_client.fetch_forecast(fetch_start, fetch_days)
 
         if not forecast_data or "timestamps" not in forecast_data:
             print("  ⚠️  Failed to fetch weather forecast")
@@ -490,15 +530,15 @@ class SimulationEngine:
                     forecasts.append((ts_str, "openmeteo", metric, float(values[i])))
 
             # Store in memory for quick access
-            if i < len(values):
+            if i < len(timestamps):
                 self.weather_forecast[ts_str] = {}
-                for metric, values in forecast_data.items():
+                for metric, metric_values in forecast_data.items():
                     if (
                         metric != "timestamps"
-                        and i < len(values)
-                        and values[i] is not None
+                        and i < len(metric_values)
+                        and metric_values[i] is not None
                     ):
-                        self.weather_forecast[ts_str][metric] = float(values[i])
+                        self.weather_forecast[ts_str][metric] = float(metric_values[i])
 
         # Save to database
         if forecasts:
