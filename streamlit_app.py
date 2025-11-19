@@ -5,6 +5,7 @@ import sqlite3
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+import plotly.graph_objects as go
 
 # Set page config
 st.set_page_config(
@@ -172,7 +173,35 @@ def main():
                 index="timestamp", columns="label", values="value", aggfunc="first"
             )
 
-        st.line_chart(pivot_df, use_container_width=True, height=500)
+        # Create Plotly figure with custom tooltip formatting
+        fig = go.Figure()
+        
+        for column in pivot_df.columns:
+            fig.add_trace(go.Scatter(
+                x=pivot_df.index,
+                y=pivot_df[column],
+                name=column,
+                mode='lines',
+                hovertemplate='<b>%{fullData.name}</b><br>' +
+                              'Time: %{x|%Y-%m-%d %H:%M:%S}<br>' +
+                              'Value: %{y:.2f}<extra></extra>'
+            ))
+        
+        fig.update_layout(
+            xaxis_title="Timestamp",
+            yaxis_title="Value",
+            hovermode='x unified',
+            height=500,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            )
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
 
         # Statistics
         st.markdown("---")

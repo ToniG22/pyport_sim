@@ -106,7 +106,7 @@ def run_optimizer_scenario():
         settings=settings,
         db_manager=db_manager,
         start_date=None,
-        days=7,
+        days=1,
     )
 
     sim.run()
