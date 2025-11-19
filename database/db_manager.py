@@ -388,16 +388,24 @@ class DatabaseManager:
             cursor.execute(query, params)
             return cursor.fetchall()
     
-    def clear_schedules(self, source: str = None):
+    def clear_schedules(self, source: str = None, from_time: str = None):
         """
         Clear scheduling entries from the database.
         
         Args:
             source: Optional source filter (clears only this source if provided)
+            from_time: Optional timestamp filter (clears only schedules from this time onwards)
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            if source:
+            if source and from_time:
+                cursor.execute(
+                    "DELETE FROM scheduling WHERE source = ? AND timestamp >= ?",
+                    (source, from_time)
+                )
+            elif source:
                 cursor.execute("DELETE FROM scheduling WHERE source = ?", (source,))
+            elif from_time:
+                cursor.execute("DELETE FROM scheduling WHERE timestamp >= ?", (from_time,))
             else:
                 cursor.execute("DELETE FROM scheduling")

@@ -87,8 +87,8 @@ def run_optimizer_scenario():
     settings = Settings(
         timestep=900,  # 15 minutes
         mode=SimulationMode.BATCH,
-        db_path="no_optimizer_scenario.db",
-        use_optimizer=False,  # ← OPTIMIZATION ENABLED
+        db_path="optimizer_scenario.db",
+        use_optimizer=True,  # ← OPTIMIZATION ENABLED
     )
 
     print(f"\n⚙️  Mode: Optimized scheduling (SCIP)")

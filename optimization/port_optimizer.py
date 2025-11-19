@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple
 from dataclasses import dataclass
 
 from pyscipopt import Model, quicksum
-from models import Port, Boat, Charger, BESS
+from models import Port, Boat, Charger, BESS, BoatState
 from database import DatabaseManager
 from forecasting import PortForecaster, EnergyForecast
 
@@ -19,6 +19,7 @@ class OptimizationResult:
     charger_schedules: Dict[str, List[Tuple[datetime, float]]]  # {charger_name: [(time, power)]}
     bess_schedules: Dict[str, List[Tuple[datetime, float]]]  # {bess_name: [(time, power)]}
     boat_charging_plan: Dict[str, List[Tuple[datetime, float]]]  # {boat_name: [(time, soc)]}
+    energy_shortfalls: Dict[str, float]  # {boat_name: shortfall_kwh} - energy that couldn't be provided
 
 
 class PortOptimizer:
@@ -139,8 +140,28 @@ class PortOptimizer:
                         name=f"bess_soc_dynamics_{bess.name}_t{t}"
                     )
         
+        # Pre-compute boat availability at each timestep
+        # boat_available[boat_name][t] = True if boat is available (not sailing) at timestep t
+        boat_available = {}
+        for boat in self.port.boats:
+            boat_available[boat.name] = {}
+            for t in timesteps:
+                forecast = energy_forecasts[t]
+                boat_state = forecast.boat_states.get(boat.name, BoatState.IDLE)
+                boat_available[boat.name][t] = (boat_state != BoatState.SAILING)
+        
+        # Pre-compute if ANY boat is available at each timestep
+        any_boat_available = {}
+        for t in timesteps:
+            forecast = energy_forecasts[t]
+            any_boat_available[t] = any(
+                forecast.boat_states.get(boat.name, BoatState.IDLE) != BoatState.SAILING
+                for boat in self.port.boats
+            )
+        
         # 2. CRITICAL: Ensure boats get charged before trips
         # This is THE PRIORITY - boats must be able to complete their trips
+        # IMPORTANT: Only charge when boats are NOT sailing (available at port)
         boat_energy_shortfall = {}
         for boat in self.port.boats:
             trips = trip_assignments.get(boat.name, [])
@@ -154,11 +175,14 @@ class PortOptimizer:
                 # Energy needed to charge to full + complete trips
                 energy_needed = boat.battery_capacity - current_energy + total_trip_energy
                 
-                # Total energy provided by ALL chargers to this boat over remaining time
+                # Total energy provided by ALL chargers to this boat
+                # ONLY when boat is NOT sailing (available at port)
+                # Use pre-computed availability to filter timesteps
+                available_timesteps = [t for t in timesteps if boat_available[boat.name][t]]
                 total_charging_energy = quicksum(
                     charger_power[charger.name][t] * charger.efficiency * self.timestep_hours
                     for charger in self.port.chargers
-                    for t in timesteps
+                    for t in available_timesteps
                 )
                 
                 # Create slack variable for energy shortfall
@@ -175,11 +199,24 @@ class PortOptimizer:
                     name=f"boat_{boat.name}_energy_requirement"
                 )
         
+        # 2b. Constraint: Chargers can only operate when boats are available (not sailing)
+        # This prevents chargers from running when boats are out on trips
+        for charger in self.port.chargers:
+            for t in timesteps:
+                if not any_boat_available[t]:
+                    # All boats are sailing - charger must be off
+                    model.addCons(
+                        charger_power[charger.name][t] == 0,
+                        name=f"charger_{charger.name}_off_when_all_sailing_t{t}"
+                    )
+        
         # 3. Power balance constraint
+        # Note: When boats are sailing, they consume energy from their own batteries,
+        # not from chargers, so charger power should be 0 (enforced above)
         for t in timesteps:
             forecast = energy_forecasts[t]
             
-            # Total charger power needed
+            # Total charger power needed (should be 0 when all boats are sailing)
             total_charger_power = quicksum(
                 charger_power[charger.name][t]
                 for charger in self.port.chargers
@@ -196,6 +233,8 @@ class PortOptimizer:
             
             # Power balance: Grid + PV + BESS >= Chargers
             # Where BESS is positive when discharging (providing power)
+            # When boats are sailing, charger_power should be 0, so this constraint
+            # allows PV and BESS to be used for other purposes or stored
             model.addCons(
                 self.port.contracted_power + pv_power_kw + total_bess_power >= total_charger_power,
                 name=f"power_balance_t{t}"
@@ -249,6 +288,7 @@ class PortOptimizer:
         charger_schedules = {}
         bess_schedules = {}
         boat_plan = {}
+        energy_shortfalls = {}
         
         # Only extract solution if optimization succeeded
         if status in ['optimal', 'bestsollimit', 'timelimit']:
@@ -273,12 +313,27 @@ class PortOptimizer:
                         schedule.append((timestamp, net_power))
                     bess_schedules[bess.name] = schedule
                 
+                # Extract energy shortfalls for each boat
+                for boat in self.port.boats:
+                    if boat.name in boat_energy_shortfall:
+                        shortfall_val = model.getVal(boat_energy_shortfall[boat.name])
+                        if shortfall_val > 0.01:  # Only report significant shortfalls (>0.01 kWh)
+                            energy_shortfalls[boat.name] = shortfall_val
+                
                 # Boat SOC plan (empty in simplified model)
                 for boat in self.port.boats:
                     boat_plan[boat.name] = []
                 
                 print(f"     ✓ Optimization complete: {status}")
                 print(f"       Objective value: {obj_value:.2f}")
+                
+                # Warn about energy shortfalls
+                if energy_shortfalls:
+                    print(f"     ⚠️  Energy shortfalls detected:")
+                    for boat_name, shortfall_kwh in energy_shortfalls.items():
+                        boat = next(b for b in self.port.boats if b.name == boat_name)
+                        shortfall_pct = (shortfall_kwh / boat.battery_capacity) * 100
+                        print(f"       {boat_name}: {shortfall_kwh:.2f} kWh ({shortfall_pct:.1f}% of battery)")
             except Exception as e:
                 print(f"     ⚠️  Error extracting solution: {e}")
                 obj_value = float('inf')
@@ -291,7 +346,8 @@ class PortOptimizer:
             objective_value=obj_value,
             charger_schedules=charger_schedules,
             bess_schedules=bess_schedules,
-            boat_charging_plan=boat_plan
+            boat_charging_plan=boat_plan,
+            energy_shortfalls=energy_shortfalls
         )
     
     def _estimate_trip_consumption_soc(
@@ -352,7 +408,12 @@ class PortOptimizer:
                 schedules.append((ts_str, bess_name, "power_setpoint", power))
         
         # Save to database
+        # IMPORTANT: Save ALL schedules, including zero values when boats are sailing
         if schedules:
             self.db_manager.save_schedules_batch(schedules)
+            # Count schedules by source to verify all timesteps are included
+            charger_count = sum(1 for s in schedules if any(c.name in s[1] for c in self.port.chargers))
+            bess_count = sum(1 for s in schedules if any(b.name in s[1] for b in self.port.bess_systems))
             print(f"     ✓ Saved {len(schedules)} schedule entries to database")
+            print(f"       (Chargers: {charger_count}, BESS: {bess_count})")
 

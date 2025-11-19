@@ -18,6 +18,7 @@ class EnergyForecast:
     bess_available_kwh: float  # BESS energy available for discharge
     bess_capacity_kwh: float  # BESS capacity available for charging
     net_balance_kwh: float  # Net energy balance (production - consumption)
+    boat_states: Dict[str, BoatState]  # Forecasted state for each boat
 
 
 class PortForecaster:
@@ -64,9 +65,17 @@ class PortForecaster:
         # Get weather forecast for the day (for PV production)
         weather_forecasts = self._get_weather_forecasts(forecast_date)
         
+        # Track boat states and trip progress for forecasting
+        boat_trip_progress = {}  # {boat_name: (trip, start_timestamp, elapsed_seconds)}
+        
         # For each timestep in the day
         for step in range(timesteps_per_day):
             timestamp = forecast_date + timedelta(seconds=step * self.timestep_seconds)
+            
+            # Forecast boat states
+            boat_states = self._forecast_boat_states(
+                timestamp, trip_assignments, boat_trip_progress
+            )
             
             # Forecast consumption (boats on trips + charging)
             consumption = self._forecast_consumption(timestamp, trip_assignments)
@@ -86,7 +95,8 @@ class PortForecaster:
                 pv_production_kwh=pv_production,
                 bess_available_kwh=bess_available,
                 bess_capacity_kwh=bess_capacity,
-                net_balance_kwh=net_balance
+                net_balance_kwh=net_balance,
+                boat_states=boat_states
             )
             
             forecasts.append(forecast)
@@ -121,6 +131,80 @@ class PortForecaster:
         # This will be calculated in the optimization phase
         
         return total_consumption
+    
+    def _forecast_boat_states(
+        self,
+        timestamp: datetime,
+        trip_assignments: Dict[str, List[Trip]],
+        boat_trip_progress: Dict[str, tuple]
+    ) -> Dict[str, BoatState]:
+        """
+        Forecast boat states at a specific timestamp.
+        
+        Args:
+            timestamp: Timestamp to forecast
+            trip_assignments: Trip assignments for boats
+            boat_trip_progress: Dict tracking active trips {boat_name: (trip, start_timestamp, elapsed_seconds)}
+            
+        Returns:
+            Dictionary mapping boat names to their forecasted states
+        """
+        boat_states = {}
+        current_hour = timestamp.hour
+        current_minute = timestamp.minute
+        
+        # Trip schedule times: (start_hour, slot_number)
+        trip_schedule = [(9, 0), (14, 1)]
+        
+        for boat in self.port.boats:
+            boat_name = boat.name
+            trips = trip_assignments.get(boat_name, [])
+            
+            # Check if boat is currently on a trip (from previous timesteps)
+            if boat_name in boat_trip_progress:
+                trip, start_timestamp, _ = boat_trip_progress[boat_name]
+                
+                # Calculate elapsed time from start timestamp
+                elapsed = (timestamp - start_timestamp).total_seconds()
+                
+                # Check if trip is complete
+                if elapsed >= trip.duration:
+                    # Trip completed, boat returns to port
+                    boat_states[boat_name] = BoatState.IDLE
+                    del boat_trip_progress[boat_name]
+                else:
+                    # Still on trip
+                    boat_states[boat_name] = BoatState.SAILING
+                    boat_trip_progress[boat_name] = (trip, start_timestamp, elapsed)
+                continue
+            
+            # Check if it's time to start a new trip
+            trip_started = False
+            for start_hour, slot in trip_schedule:
+                # Start trip at the scheduled hour (check within the timestep window)
+                if current_hour == start_hour and current_minute < (self.timestep_seconds / 60):
+                    # Get trip for this slot
+                    if slot < len(trips):
+                        trip = trips[slot]
+                        
+                        # Estimate energy required
+                        estimated_energy = trip.estimate_energy_required(boat.k)
+                        required_soc = estimated_energy / boat.battery_capacity
+                        
+                        # Assume boat has enough charge (optimistic forecast)
+                        # In reality, this might be delayed, but for forecasting we assume trips start on time
+                        boat_states[boat_name] = BoatState.SAILING
+                        boat_trip_progress[boat_name] = (trip, timestamp, 0.0)
+                        trip_started = True
+                        break
+            
+            if not trip_started:
+                # Not on a trip - could be IDLE or CHARGING
+                # For forecasting, we'll assume boats are IDLE when not sailing
+                # (Charging state would require optimization knowledge)
+                boat_states[boat_name] = BoatState.IDLE
+        
+        return boat_states
     
     def _forecast_boat_consumption(
         self,
@@ -157,7 +241,7 @@ class PortForecaster:
             elif hour >= 14 and hour < 18:
                 # Second trip
                 if len(trips) > 1:
-                    trip = trips[1] if len(trips) > 1 else trips[0]
+                    trip = trips[1]
                 avg_power = trip.estimate_energy_required(boat.k) / (trip.duration / 3600)
                 energy_kwh = avg_power * (self.timestep_seconds / 3600)
                 return energy_kwh
@@ -296,6 +380,12 @@ class PortForecaster:
             forecast_data.append((ts_str, forecast_type, "bess_available", forecast.bess_available_kwh))
             forecast_data.append((ts_str, forecast_type, "bess_capacity", forecast.bess_capacity_kwh))
             forecast_data.append((ts_str, forecast_type, "net_balance", forecast.net_balance_kwh))
+            
+            # Save boat state forecasts (metric="state", source=boat_name)
+            # Use same format as measurements: 1.0 for sailing, 0.0 otherwise
+            for boat_name, boat_state in forecast.boat_states.items():
+                state_value = 1.0 if boat_state == BoatState.SAILING else 0.0
+                forecast_data.append((ts_str, boat_name, "state", state_value))
         
         if forecast_data:
             self.db_manager.save_forecasts_batch(forecast_data)
