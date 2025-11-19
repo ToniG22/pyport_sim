@@ -1,138 +1,136 @@
 """Main entry point for the electric port simulator."""
 
-from models import Port, Boat, BoatState, Charger, ChargerState
+from models import Port, Boat, Charger, PV, BESS, BESSControlStrategy
 from config import Settings, SimulationMode
 from database import DatabaseManager
-from datetime import datetime, timezone
+from simulation import SimulationEngine
 
 
 def main():
     """Main function to run the simulator."""
+    print("=" * 60)
     print("Electric Port Simulator")
-    print("=" * 50)
+    print("=" * 60)
 
-    # Example: Create a port
+    # ========================================================================
+    # CONFIGURATION SECTION - Modify these values to customize your simulation
+    # ========================================================================
+
+    # Port configuration
+    #  Change port name, contracted power, and location as needed
     port = Port(
         name="Marina del Sol",
-        contracted_power=100,
-        lat=32.64542,
-        lon=-16.90841,  # 100 kW
+        contracted_power=40,  #  Adjust contracted power limit (kW)
+        lat=32.64542,  #  Set port latitude
+        lon=-16.90841,  #  Set port longitude
     )
 
-    # Example: Create boats
-    print("\n" + "=" * 50)
-    print("Creating boats...")
-    print("=" * 50)
-
+    # Boat configuration
+    #  Add/remove boats, modify boat parameters (motor_power, weight, length,
+    #       battery_capacity, range_speed, soc) as needed
     boat1 = Boat(
         name="SeaBreeze",
-        motor_power=50,  # kW
-        weight=2500,  # kg
-        length=8.5,  # m
-        battery_capacity=60,  # kWh
-        range_speed=8.0,  # knots
-        soc=0.35,  # 35% charge
+        motor_power=120,  #  Adjust motor power (kW)
+        weight=2500,  #  Adjust weight (kg)
+        length=8.5,  #  Adjust length (m)
+        battery_capacity=150,  #  Adjust battery capacity (kWh)
+        range_speed=15.0,  #  Adjust range speed (knots)
+        soc=0.30,  #  Adjust initial state of charge (0.0-1.0)
     )
-    print(f"Boat 1: {boat1}")
-    print(f"  - K-factor: {boat1.k:.4f}")
 
     boat2 = Boat(
-        motor_power=30,
-        weight=1800,
-        length=7.0,
-        battery_capacity=40,
-        range_speed=6.5,
-        soc=0.80,
+        name="SeaBreeze_2",
+        motor_power=100,  #  Adjust motor power (kW)
+        weight=2500,  #  Adjust weight (kg)
+        length=8.5,  #  Adjust length (m)
+        battery_capacity=100,  #  Adjust battery capacity (kWh)
+        range_speed=16.0,  #  Adjust range speed (knots)
+        soc=0.50,  #  Adjust initial state of charge (0.0-1.0)
     )
-    print(f"\nBoat 2: {boat2}")
-    print(f"  - K-factor: {boat2.k:.4f}")
 
-    # Example: Create chargers
-    print("\n" + "=" * 50)
-    print("Creating chargers...")
-    print("=" * 50)
+    # Charger configuration
+    #  Add/remove chargers, modify max_power and efficiency as needed
+    charger1 = Charger(
+        name="FastCharger_A", max_power=22, efficiency=0.95
+    )  #  Adjust max_power (kW) and efficiency
+    charger2 = Charger(
+        name="FastCharger_B", max_power=22, efficiency=0.95
+    )  #  Adjust max_power (kW) and efficiency
 
-    charger1 = Charger(name="FastCharger_A", max_power=22, efficiency=0.95)
-    print(f"Charger 1: {charger1}")
+    # PV system configuration
+    #  Modify PV capacity, tilt, azimuth, efficiency, or remove PV system entirely
+    pv_system = PV(
+        name="Solar_Array_1",
+        capacity=30.0,  #  Adjust PV capacity (kW DC)
+        tilt=30.0,  #  Adjust panel tilt angle (degrees)
+        azimuth=180.0,  #  Adjust panel azimuth (degrees, 180 = South-facing)
+        efficiency=0.85,  #  Adjust system efficiency (0.0-1.0)
+        latitude=port.lat,
+        longitude=port.lon,
+    )
 
-    charger2 = Charger(max_power=11, efficiency=0.93)
-    print(f"\nCharger 2: {charger2}")
+    # BESS (Battery Energy Storage System) configuration
+    #  Modify BESS parameters or remove BESS entirely
+    bess = BESS(
+        name="Battery_Storage_1",
+        capacity=100.0,  #  Adjust BESS capacity (kWh)
+        max_charge_power=25.0,  #  Adjust max charge power (kW)
+        max_discharge_power=25.0,  #  Adjust max discharge power (kW)
+        efficiency=0.90,  #  Adjust round-trip efficiency (0.0-1.0)
+        soc_min=0.10,  #  Adjust minimum SOC (0.0-1.0)
+        soc_max=0.90,  #  Adjust maximum SOC (0.0-1.0)
+        initial_soc=0.50,  #  Adjust initial SOC (0.0-1.0)
+        control_strategy=BESSControlStrategy.DEFAULT,  #  Change control strategy if needed
+    )
 
-    # Add boats and chargers to port
+    # Add components to port
     port.add_boat(boat1)
     port.add_boat(boat2)
     port.add_charger(charger1)
     port.add_charger(charger2)
+    port.add_pv(pv_system)
+    port.add_bess(bess)
 
-    print(f"\nPort configured: {port}")
+    print(f"\nPort: {port}")
+    print(f"Boats: {boat1.name}, {boat2.name}")
+    print(f"Chargers: {charger1.name}, {charger2.name}")
+    print(f"PV: {pv_system}")
+    print(f"BESS: {bess}")
 
-    # Simulate charger connecting to boat
-    print("\n" + "=" * 50)
-    print("Simulating charging state...")
-    print("=" * 50)
-    charger1.state = ChargerState.CHARGING
-    charger1.power = 20.0  # Charging at 20kW
-    charger1.connected_boat = boat1.name
-    boat1.state = BoatState.CHARGING
-    print(f"\nCharger status: {charger1}")
-    print(f"  - Effective power to battery: {charger1.effective_power:.1f}kW")
-    print(f"Boat status: {boat1}")
-
-    # Initialize settings
+    # Simulation settings
+    #  Modify simulation parameters (timestep, mode, db_path, use_optimizer, start_date, days)
     settings = Settings(
-        timestep=900,  # 15 minute timesteps
-        mode=SimulationMode.BATCH,
-        db_path="port_simulation.db",
+        timestep=900,  #  Adjust timestep duration (seconds, 900 = 15 minutes)
+        mode=SimulationMode.BATCH,  #  Change to SimulationMode.REALTIME for real-time simulation
+        db_path="port_simulation.db",  #  Change database file path if needed
+        use_optimizer=True,  #  Set to False to disable optimization (SCIP)
     )
 
-    print(f"\nSettings: timestep={settings.timestep}s, mode={settings.mode.value}")
+    print(f"\n⚙️  Mode: Optimized scheduling (SCIP)")
+    print(f"   - Forecasting: Enabled")
+    print(f"   - Optimization: Enabled")
+    print(f"   - Objective: Minimize trip delays + grid usage")
 
     # Initialize database
     db_manager = DatabaseManager(settings.db_path)
     db_manager.initialize_schema()
-    print(f"\nDatabase initialized: {settings.db_path}")
 
-    # Example: Save some measurements
-    print("\n" + "=" * 50)
-    print("Example: Saving measurements to database (UTC timestamps)")
-    print("=" * 50)
+    # Create and run simulation
+    #  Modify start_date (None = current time) and days (simulation duration)
+    sim = SimulationEngine(
+        port=port,
+        settings=settings,
+        db_manager=db_manager,
+        start_date=None,  #  Set specific start date (datetime) or None for current time
+        days=1,  #  Adjust simulation duration (days)
+    )
 
-    current_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    sim.run()
 
-    # Save measurements using batch insert (with UTC timestamp strings)
-    sample_measurements = [
-        (current_timestamp, "port", "total_power", 125.5),
-        (current_timestamp, "port", "contracted_power", 500.0),
-        (current_timestamp, "boat_001", "soc", 85.5),
-        (current_timestamp, "boat_001", "power_draw", 22.5),
-        (current_timestamp, "charger_01", "power_output", 22.5),
-        (current_timestamp, "bess_01", "soc", 65.3),
-        (current_timestamp, "bess_01", "power_flow", -15.0),
-        (current_timestamp, "pv_01", "power_output", 50.2),
-    ]
-
-    db_manager.save_measurements_batch(sample_measurements)
-    print(f"✓ Saved {len(sample_measurements)} measurements at {current_timestamp} UTC")
-
-    # Query back some data
-    print("\nQuerying measurements for 'boat_001':")
-    boat_data = db_manager.get_measurements(source="boat_001")
-    for row in boat_data:
-        print(f"  - {row['timestamp']} | {row['metric']}: {row['value']}")
-
-    print("\nQuerying all 'soc' metrics:")
-    soc_data = db_manager.get_measurements(metric="soc")
-    for row in soc_data:
-        print(f"  - {row['source']}: {row['value']}%")
-
-    print("\n" + "=" * 50)
-    print("Ready for simulation setup!")
-    print("\nNext steps:")
-    print("  1. Define Boat model")
-    print("  2. Define Charger model")
-    print("  3. Define BESS model")
-    print("  4. Define PV model")
-    print("  5. Implement simulation engine")
+    print("\n" + "=" * 60)
+    print(f"✓ Results saved to: {settings.db_path}")
+    print(f"✓ View data using: streamlit run streamlit_app.py")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
