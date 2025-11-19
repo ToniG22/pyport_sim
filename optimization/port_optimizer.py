@@ -65,7 +65,7 @@ class PortOptimizer:
         Returns:
             OptimizationResult with optimal schedules
         """
-        print(f"     🔧 Optimizing energy schedule...")
+        print(f"     🔧 Optimizing energy schedule (with tariff pricing)...")
         
         # Create optimization model
         model = Model("port_energy_optimization")
@@ -130,13 +130,41 @@ class PortOptimizer:
                     # Positive power = discharging (decreases SOC)
                     power = bess_power[bess.name][t-1]
                     
-                    # When discharging (power > 0): lose energy/efficiency
-                    # When charging (power < 0): gain energy*efficiency
-                    # Simplified: just track net change
-                    energy_change = -power * self.timestep_hours / bess.capacity  # Negative power increases SOC
+                    # We need to handle charging and discharging differently due to efficiency
+                    # For linear programming, we use separate charge and discharge variables
+                    # Charge power (positive when charging)
+                    charge_power = model.addVar(
+                        name=f"bess_charge_{bess.name}_t{t-1}",
+                        vtype="C",
+                        lb=0,
+                        ub=bess.max_charge_power
+                    )
+                    
+                    # Discharge power (positive when discharging)
+                    discharge_power = model.addVar(
+                        name=f"bess_discharge_{bess.name}_t{t-1}",
+                        vtype="C",
+                        lb=0,
+                        ub=bess.max_discharge_power
+                    )
+                    
+                    # Constraint: net power = discharge - charge
+                    model.addCons(
+                        power == discharge_power - charge_power,
+                        name=f"bess_power_split_{bess.name}_t{t-1}"
+                    )
+                    
+                    # SOC change accounting for efficiency:
+                    # When charging: energy stored = charge_power * time * efficiency
+                    # When discharging: energy removed = discharge_power * time / efficiency
+                    energy_stored = charge_power * self.timestep_hours * bess.efficiency
+                    energy_removed = discharge_power * self.timestep_hours / bess.efficiency
+                    
+                    # SOC change (normalized by capacity)
+                    soc_change = (energy_stored - energy_removed) / bess.capacity
                     
                     model.addCons(
-                        bess_soc[bess.name][t] == bess_soc[bess.name][t-1] + energy_change,
+                        bess_soc[bess.name][t] == bess_soc[bess.name][t-1] + soc_change,
                         name=f"bess_soc_dynamics_{bess.name}_t{t}"
                     )
         
@@ -241,18 +269,26 @@ class PortOptimizer:
             )
         
         # ===================================================================
-        # OBJECTIVE FUNCTION: Prioritize boat charging, then minimize grid
+        # OBJECTIVE FUNCTION: Prioritize boat charging, then minimize cost-weighted grid usage
         # ===================================================================
         
         # PRIMARY: Penalize energy shortfall for boats (MUST charge boats for trips!)
         boat_shortfall_penalty = quicksum(boat_energy_shortfall.values()) * 100000  # HUGE penalty
         
-        # SECONDARY: Minimize grid energy usage
-        total_grid_energy = 0
+        # SECONDARY: Minimize cost-weighted grid energy usage
+        # This encourages:
+        # - Charging BESS during low-price periods (to store energy for later)
+        # - Discharging BESS during high-price periods (to avoid buying expensive grid power)
+        # - Using grid power during low-price periods
+        total_grid_cost = 0
         for t in timesteps:
             forecast = energy_forecasts[t]
+            timestamp = forecast_date + timedelta(seconds=t * self.timestep_seconds)
             
-            # Charger load
+            # Get tariff price for this timestep
+            price_per_kwh = self.port.get_tariff_price(timestamp)
+            
+            # Charger load (from grid)
             charger_load = quicksum(charger_power[charger.name][t] for charger in self.port.chargers)
             
             # BESS net power (positive = discharge, negative = charge)
@@ -262,13 +298,39 @@ class PortOptimizer:
             pv_power = forecast.pv_production_kwh / self.timestep_hours
             
             # Grid usage = load - PV - BESS_discharge
+            # Positive = drawing from grid, Negative = excess (shouldn't happen due to constraints)
             grid_power = charger_load - pv_power - bess_net
             
-            total_grid_energy += grid_power * self.timestep_hours
+            # Grid energy (kWh) for this timestep
+            grid_energy = grid_power * self.timestep_hours
+            
+            # Cost-weighted grid energy
+            # The optimizer will naturally:
+            # - Charge BESS when prices are low (bess_net < 0 increases grid_power, but price is low)
+            # - Discharge BESS when prices are high (bess_net > 0 decreases grid_power, avoiding high costs)
+            # Since grid_energy can theoretically be negative (excess PV), we need to handle that
+            # For linear programming, we create a variable for grid energy purchased (always >= 0)
+            grid_energy_purchased = model.addVar(
+                name=f"grid_energy_purchased_t{t}",
+                vtype="C",
+                lb=0
+            )
+            
+            # Constraint: grid_energy_purchased >= grid_energy
+            # Since we're minimizing cost, it will equal max(0, grid_energy)
+            model.addCons(
+                grid_energy_purchased >= grid_energy,
+                name=f"grid_energy_purchased_constraint_t{t}"
+            )
+            
+            # Cost for this timestep: grid energy purchased * price
+            timestep_cost = grid_energy_purchased * price_per_kwh
+            
+            total_grid_cost += timestep_cost
         
-        # Combined objective: HEAVILY prioritize boat charging
+        # Combined objective: HEAVILY prioritize boat charging, then minimize costs
         model.setObjective(
-            boat_shortfall_penalty + total_grid_energy,
+            boat_shortfall_penalty + total_grid_cost,
             "minimize"
         )
         
