@@ -815,27 +815,23 @@ class SimulationEngine:
             c for c in self.port.chargers if c.state == ChargerState.IDLE
         ]
 
-        # Calculate available power at port (including PV production and BESS discharge)
+        # Calculate available power at port
+        # Formula: available = contracted_power + renewables + usable_bess - used_power
         used_power = sum(
             c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
         )
         pv_production = sum(pv.current_production for pv in self.port.pv_systems)
 
-        # BESS contribution (negative power means discharging, adds to available power)
-        bess_discharge = sum(
-            -bess.current_power
-            for bess in self.port.bess_systems
-            if bess.current_power < 0
-        )
-
-        # Calculate potential BESS discharge capacity (what BESS COULD provide)
-        potential_bess_discharge = sum(
+        # BESS usable capacity = potential discharge power available
+        # This is what BESS COULD provide if needed (based on SOC and max discharge rate)
+        bess_usable_capacity = sum(
             bess.get_max_discharge_power_available(self.settings.timestep)
             for bess in self.port.bess_systems
         )
 
+        # Available power = grid capacity + PV production + BESS usable capacity - current consumption
         available_power = (
-            self.port.contracted_power + pv_production + bess_discharge - used_power
+            self.port.contracted_power + pv_production + bess_usable_capacity - used_power
         )
 
         # Assign boats to chargers
@@ -844,20 +840,9 @@ class SimulationEngine:
                 break
 
             charger = available_chargers.pop(0)
-
-            # Check if we have enough power to run this charger at max
-            # If not enough immediate power, check if BESS can cover the deficit
             power_needed = charger.max_power
 
             if available_power >= power_needed:
-                # Sufficient power available directly
-                can_assign = True
-            else:
-                # Not enough power - check if BESS can cover the deficit
-                deficit = power_needed - available_power
-                can_assign = potential_bess_discharge >= deficit
-
-            if can_assign:
                 # Assign boat to charger
                 self.boat_charger_map[boat.name] = charger.name
                 boat.state = BoatState.CHARGING
@@ -865,11 +850,6 @@ class SimulationEngine:
                 charger.power = charger.max_power
                 charger.connected_boat = boat.name
                 available_power -= charger.max_power
-
-                # Reduce potential BESS discharge if we're counting on it
-                if available_power < 0:
-                    potential_bess_discharge -= abs(available_power)
-                    available_power = 0
 
                 # Log charging start
                 if self.current_datetime.minute % 15 == 0:
@@ -1101,27 +1081,33 @@ class SimulationEngine:
         # Convert current datetime to ISO format string (UTC)
         timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Calculate PV production
+        # Calculate PV production (renewables)
         total_pv_production = sum(pv.current_production for pv in self.port.pv_systems)
 
-        # Calculate BESS contribution
+        # Calculate BESS current state
         total_bess_power = sum(bess.current_power for bess in self.port.bess_systems)
         # Positive = charging (consuming power), Negative = discharging (providing power)
         bess_discharge = -total_bess_power if total_bess_power < 0 else 0
         bess_charge = total_bess_power if total_bess_power > 0 else 0
+
+        # Calculate BESS usable capacity (what it COULD provide if needed)
+        bess_usable_capacity = sum(
+            bess.get_max_discharge_power_available(self.settings.timestep)
+            for bess in self.port.bess_systems
+        )
 
         # Calculate port metrics
         total_power_used = sum(
             c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
         )
 
-        # Available power = contracted power + PV production + BESS discharge - power used - BESS charge
+        # Available power = contracted_power + renewables + usable_bess - used_power
+        # This represents the maximum power the port could still draw/use
         available_power = (
             self.port.contracted_power
             + total_pv_production
-            + bess_discharge
+            + bess_usable_capacity
             - total_power_used
-            - bess_charge
         )
 
         # Get source and metric IDs
