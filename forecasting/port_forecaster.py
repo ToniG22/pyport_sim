@@ -17,7 +17,6 @@ class EnergyForecast:
     power_active_production_kwh: float  # Expected PV production in the timestep
     bess_available_kwh: float  # BESS energy available for discharge
     bess_capacity_kwh: float  # BESS capacity available for charging
-    net_balance_kwh: float  # Net energy balance (production - consumption)
     boat_states: Dict[str, BoatState]  # Forecasted state for each boat
 
 
@@ -86,16 +85,12 @@ class PortForecaster:
             # Calculate BESS availability (assuming current SOC)
             bess_available, bess_capacity = self._calculate_bess_availability()
             
-            # Net balance
-            net_balance = power_active_production - power_active_consumption
-            
             forecast = EnergyForecast(
                 timestamp=timestamp,
                 power_active_consumption_kwh=power_active_consumption,
                 power_active_production_kwh=power_active_production,
                 bess_available_kwh=bess_available,
                 bess_capacity_kwh=bess_capacity,
-                net_balance_kwh=net_balance,
                 boat_states=boat_states
             )
             
@@ -111,6 +106,9 @@ class PortForecaster:
         """
         Forecast active power consumption at a specific timestamp.
         
+        This forecasts the port's electrical consumption (chargers + BESS),
+        NOT the boat's motor energy usage while sailing.
+        
         Args:
             timestamp: Timestamp to forecast
             trip_assignments: Trip assignments for boats
@@ -120,15 +118,13 @@ class PortForecaster:
         """
         total_power_active_consumption = 0.0
         
-        for boat in self.port.boats:
-            # Check if boat is on a trip at this timestamp
-            boat_power_active_consumption = self._forecast_boat_power_active_consumption(
-                boat, timestamp, trip_assignments.get(boat.name, [])
-            )
-            total_power_active_consumption += boat_power_active_consumption
+        # Forecast charger consumption based on boats at port
+        charger_consumption = self._forecast_charger_consumption(timestamp, trip_assignments)
+        total_power_active_consumption += charger_consumption
         
-        # Note: Charger consumption is based on boat charging needs
-        # This will be calculated in the optimization phase
+        # BESS consumption (charging from grid/PV) is typically handled in optimization
+        # For forecasting, we assume BESS may charge during low-demand/high-production periods
+        # This is a simplified estimate - actual BESS behavior depends on control strategy
         
         return total_power_active_consumption
     
@@ -206,48 +202,107 @@ class PortForecaster:
         
         return boat_states
     
-    def _forecast_boat_power_active_consumption(
+    def _forecast_charger_consumption(
         self,
-        boat: Boat,
         timestamp: datetime,
-        trips: List[Trip]
+        trip_assignments: Dict[str, List[Trip]]
     ) -> float:
         """
-        Forecast a single boat's active power consumption.
+        Forecast charger power consumption based on boats at port.
+        
+        When boats are at port (not sailing), they may be charging.
+        This estimates the port's electrical consumption from chargers.
         
         Args:
-            boat: Boat to forecast
-            timestamp: Timestamp to check
-            trips: Trips assigned to this boat
+            timestamp: Timestamp to forecast
+            trip_assignments: Trip assignments for boats
             
         Returns:
-            Expected energy consumption in kWh for the timestep
+            Expected charger energy consumption in kWh for the timestep
         """
-        # Check if boat is on a trip at this timestamp
-        # Trips typically start at 9:00 and 14:00
-        for trip in trips:
-            # Check if this trip would be active at this timestamp
-            # This is a simplified check - actual trip timing depends on schedule
-            hour = timestamp.hour
-            
-            # Morning trip (9:00-13:00 approximately)
-            if hour >= 9 and hour < 13:
-                # Use average power consumption for the trip
-                avg_power = trip.estimate_energy_required(boat.k) / (trip.duration / 3600)
-                energy_kwh = avg_power * (self.timestep_seconds / 3600)
-                return energy_kwh
-            
-            # Afternoon trip (14:00-18:00 approximately)
-            elif hour >= 14 and hour < 18:
-                # Second trip
-                if len(trips) > 1:
-                    trip = trips[1]
-                avg_power = trip.estimate_energy_required(boat.k) / (trip.duration / 3600)
-                energy_kwh = avg_power * (self.timestep_seconds / 3600)
-                return energy_kwh
+        if not self.port.chargers:
+            return 0.0
         
-        # Not on a trip - no motor consumption
-        return 0.0
+        total_charger_consumption = 0.0
+        hour = timestamp.hour
+        
+        # Determine which boats are at port (not on trips)
+        boats_at_port = []
+        for boat in self.port.boats:
+            trips = trip_assignments.get(boat.name, [])
+            is_sailing = self._is_boat_sailing(hour, trips)
+            if not is_sailing:
+                boats_at_port.append(boat)
+        
+        # Estimate charging demand based on boats at port
+        # Simplified model: boats at port may charge if they have trips ahead
+        for boat in boats_at_port:
+            trips = trip_assignments.get(boat.name, [])
+            
+            # Check if boat has upcoming trips that require charging
+            needs_charging = self._boat_needs_charging(hour, trips, boat)
+            
+            if needs_charging:
+                # Estimate charger power usage (use first available charger's max power)
+                # In reality, this depends on charger assignment and boat's charging curve
+                charger_power = self.port.chargers[0].max_power if self.port.chargers else 0.0
+                energy_kwh = charger_power * (self.timestep_seconds / 3600)
+                total_charger_consumption += energy_kwh
+        
+        return total_charger_consumption
+    
+    def _is_boat_sailing(self, hour: int, trips: List[Trip]) -> bool:
+        """
+        Check if a boat is sailing at a given hour.
+        
+        Args:
+            hour: Hour of day (0-23)
+            trips: Trips assigned to the boat
+            
+        Returns:
+            True if the boat is estimated to be sailing
+        """
+        if not trips:
+            return False
+        
+        # Morning trip window (approximately 9:00-13:00)
+        if hour >= 9 and hour < 13:
+            return True
+        
+        # Afternoon trip window (approximately 14:00-18:00)
+        if hour >= 14 and hour < 18 and len(trips) > 1:
+            return True
+        
+        return False
+    
+    def _boat_needs_charging(self, hour: int, trips: List[Trip], boat: Boat) -> bool:
+        """
+        Estimate if a boat needs charging based on upcoming trips.
+        
+        Args:
+            hour: Current hour of day
+            trips: Trips assigned to the boat
+            boat: Boat instance
+            
+        Returns:
+            True if the boat likely needs charging
+        """
+        if not trips:
+            return False
+        
+        # Before morning trip (charging window: ~0:00-9:00)
+        if hour < 9:
+            return True
+        
+        # Between trips (charging window: ~13:00-14:00)
+        if hour >= 13 and hour < 14 and len(trips) > 1:
+            return True
+        
+        # After afternoon trip (charging window: ~18:00-24:00)
+        if hour >= 18:
+            return True
+        
+        return False
     
     def _forecast_power_active_production(
         self,
@@ -384,7 +439,6 @@ class PortForecaster:
         power_active_production_met = self.db_manager.get_metric_id("power_active_production")
         bess_available_met = self.db_manager.get_metric_id("bess_available")
         bess_capacity_met = self.db_manager.get_metric_id("bess_capacity")
-        net_balance_met = self.db_manager.get_metric_id("net_balance")
         state_met = self.db_manager.get_metric_id("state")
         
         for forecast in forecasts:
@@ -395,7 +449,6 @@ class PortForecaster:
             forecast_data.append((ts_str, port_src, power_active_production_met, str(forecast.power_active_production_kwh)))
             forecast_data.append((ts_str, port_src, bess_available_met, str(forecast.bess_available_kwh)))
             forecast_data.append((ts_str, port_src, bess_capacity_met, str(forecast.bess_capacity_kwh)))
-            forecast_data.append((ts_str, port_src, net_balance_met, str(forecast.net_balance_kwh)))
             
             # Save boat state forecasts (metric="state", source=boat_name)
             # Use same format as measurements: 1.0 for sailing, 0.0 otherwise
@@ -426,7 +479,6 @@ class PortForecaster:
         print(f"     Total Consumption: {total_power_active_consumption:.2f} kWh")
         print(f"     Total Production: {total_power_active_production:.2f} kWh")
         print(f"     Avg BESS Available: {avg_bess_available:.2f} kWh")
-        print(f"     Net Balance: {total_power_active_production - total_power_active_consumption:.2f} kWh")
         
         # Peak consumption time
         peak_forecast = max(forecasts, key=lambda f: f.power_active_consumption_kwh)
