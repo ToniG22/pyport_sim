@@ -338,13 +338,18 @@ class PortForecaster:
         start_str = forecast_date.strftime("%Y-%m-%d 00:00:00")
         end_str = (forecast_date + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
         
+        # Get source ID for openmeteo
+        openmeteo_src = self.db_manager.get_or_create_source("openmeteo", "weather")
+        
         # Fetch all weather metrics
         metrics = ['ghi', 'dni', 'dhi', 'temperature']
         
         for metric in metrics:
-            forecast_rows = self.db_manager.get_forecasts(
-                source='openmeteo',
-                metric=metric,
+            metric_id = self.db_manager.get_metric_id(metric)
+            forecast_rows = self.db_manager.get_records(
+                "forecast",
+                source_id=openmeteo_src,
+                metric_id=metric_id,
                 start_time=start_str,
                 end_time=end_str
             )
@@ -353,42 +358,52 @@ class PortForecaster:
                 ts_str = row['timestamp']
                 if ts_str not in weather_data:
                     weather_data[ts_str] = {}
-                weather_data[ts_str][metric] = row['value']
+                weather_data[ts_str][metric] = float(row['value'])
         
         return weather_data
     
     def save_forecasts_to_db(
         self,
         forecasts: List[EnergyForecast],
-        forecast_type: str = "energy"
+        forecast_type: str = "port_energy"
     ) -> None:
         """
         Save energy forecasts to the database.
         
         Args:
             forecasts: List of energy forecasts
-            forecast_type: Type identifier for the forecasts
+            forecast_type: Type identifier for the forecasts (used as source_type)
         """
         forecast_data = []
+        
+        # Get source and metric IDs (use same metric names as measurements for consistency)
+        forecast_src = self.db_manager.get_or_create_source(forecast_type, "forecast")
+        consumption_met = self.db_manager.get_metric_id("power_active_consumption")
+        pv_production_met = self.db_manager.get_metric_id("power_active_production")
+        bess_available_met = self.db_manager.get_metric_id("bess_available")
+        bess_capacity_met = self.db_manager.get_metric_id("bess_capacity")
+        net_balance_met = self.db_manager.get_metric_id("net_balance")
+        state_met = self.db_manager.get_metric_id("state")
         
         for forecast in forecasts:
             ts_str = forecast.timestamp.strftime("%Y-%m-%d %H:%M:%S")
             
-            # Save each forecast metric
-            forecast_data.append((ts_str, forecast_type, "consumption", forecast.consumption_kwh))
-            forecast_data.append((ts_str, forecast_type, "pv_production", forecast.pv_production_kwh))
-            forecast_data.append((ts_str, forecast_type, "bess_available", forecast.bess_available_kwh))
-            forecast_data.append((ts_str, forecast_type, "bess_capacity", forecast.bess_capacity_kwh))
-            forecast_data.append((ts_str, forecast_type, "net_balance", forecast.net_balance_kwh))
+            # Save each forecast metric (values are energy in kWh for the timestep)
+            forecast_data.append((ts_str, forecast_src, consumption_met, str(forecast.consumption_kwh)))
+            forecast_data.append((ts_str, forecast_src, pv_production_met, str(forecast.pv_production_kwh)))
+            forecast_data.append((ts_str, forecast_src, bess_available_met, str(forecast.bess_available_kwh)))
+            forecast_data.append((ts_str, forecast_src, bess_capacity_met, str(forecast.bess_capacity_kwh)))
+            forecast_data.append((ts_str, forecast_src, net_balance_met, str(forecast.net_balance_kwh)))
             
             # Save boat state forecasts (metric="state", source=boat_name)
             # Use same format as measurements: 1.0 for sailing, 0.0 otherwise
             for boat_name, boat_state in forecast.boat_states.items():
+                boat_src = self.db_manager.get_or_create_source(boat_name, "boat")
                 state_value = 1.0 if boat_state == BoatState.SAILING else 0.0
-                forecast_data.append((ts_str, boat_name, "state", state_value))
+                forecast_data.append((ts_str, boat_src, state_met, str(state_value)))
         
         if forecast_data:
-            self.db_manager.save_forecasts_batch(forecast_data)
+            self.db_manager.save_records_batch("forecast", forecast_data)
     
     def print_forecast_summary(self, forecasts: List[EnergyForecast]) -> None:
         """

@@ -2,7 +2,7 @@
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 
 from models import Port, BoatState, ChargerState, Trip
 from database import DatabaseManager
@@ -21,7 +21,7 @@ class SimulationEngine:
         port: Port,
         settings: Settings,
         db_manager: DatabaseManager,
-        start_date: Optional[datetime] = None,
+        start_date: Optional[Union[datetime, str]] = None,
         days: int = 1,
         trips_directory: str = "assets/trips",
     ):
@@ -32,7 +32,7 @@ class SimulationEngine:
             port: Port instance (contains boats and chargers)
             settings: Simulation settings
             db_manager: Database manager
-            start_date: Simulation start date (default: today at midnight UTC)
+            start_date: Simulation start date as datetime or string "YYYY-MM-DD" (default: today at midnight UTC)
             days: Number of days to simulate (max 7)
             trips_directory: Directory containing trip CSV files
         """
@@ -44,6 +44,9 @@ class SimulationEngine:
         if start_date is None:
             now = datetime.now(timezone.utc)
             self.start_date = datetime(now.year, now.month, now.day, 0, 0, 0)
+        elif isinstance(start_date, str):
+            # Handle string dates (e.g., "2025-09-01")
+            self.start_date = datetime.strptime(start_date, "%Y-%m-%d")
         else:
             self.start_date = start_date
 
@@ -319,12 +322,14 @@ class SimulationEngine:
         current_time_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
         for charger in self.port.chargers:
             # Clear only schedules from current time onwards
-            self.db_manager.clear_schedules(
-                source=charger.name, from_time=current_time_str
+            charger_src = self.db_manager.get_or_create_source(charger.name, "charger")
+            self.db_manager.clear_records(
+                "scheduling", source_id=charger_src, from_time=current_time_str
             )
         for bess in self.port.bess_systems:
-            self.db_manager.clear_schedules(
-                source=bess.name, from_time=current_time_str
+            bess_src = self.db_manager.get_or_create_source(bess.name, "bess")
+            self.db_manager.clear_records(
+                "scheduling", source_id=bess_src, from_time=current_time_str
             )
 
         # Get trip assignments for today (remaining trips)
@@ -621,19 +626,22 @@ class SimulationEngine:
     def _assign_boats_to_chargers_with_schedule(self):
         """Assign boats to chargers using optimized schedules from database."""
         timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
 
         # Get charger power setpoints from schedule
         for charger in self.port.chargers:
-            schedule = self.db_manager.get_schedules(
-                source=charger.name,
-                metric="power_setpoint",
+            charger_src = self.db_manager.get_or_create_source(charger.name, "charger")
+            schedule = self.db_manager.get_records(
+                "scheduling",
+                source_id=charger_src,
+                metric_id=power_setpoint_met,
                 start_time=timestamp_str,
                 end_time=timestamp_str,
             )
 
             if schedule:
                 # Use scheduled power
-                scheduled_power = schedule[0]["value"]
+                scheduled_power = float(schedule[0]["value"])
 
                 if scheduled_power > 0.1 and charger.state == ChargerState.IDLE:
                     # Find a boat that needs charging
@@ -922,6 +930,8 @@ class SimulationEngine:
 
         # Save to database
         forecasts = []
+        openmeteo_src = self.db_manager.get_or_create_source("openmeteo", "weather")
+        
         for i, ts in enumerate(timestamps):
             ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -931,7 +941,8 @@ class SimulationEngine:
                     continue
 
                 if i < len(values) and values[i] is not None:
-                    forecasts.append((ts_str, "openmeteo", metric, float(values[i])))
+                    metric_id = self.db_manager.get_metric_id(metric)
+                    forecasts.append((ts_str, openmeteo_src, metric_id, str(float(values[i]))))
 
             # Store in memory for quick access
             if i < len(timestamps):
@@ -946,7 +957,7 @@ class SimulationEngine:
 
         # Save to database
         if forecasts:
-            self.db_manager.save_forecasts_batch(forecasts)
+            self.db_manager.save_records_batch("forecast", forecasts)
             print(f"  ✓ Saved {len(forecasts)} forecast values to database")
 
         self.forecast_loaded = True
@@ -1008,18 +1019,21 @@ class SimulationEngine:
     def _update_bess_with_schedule(self):
         """Update BESS using optimized schedules from database."""
         timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
 
         for bess in self.port.bess_systems:
-            schedule = self.db_manager.get_schedules(
-                source=bess.name,
-                metric="power_setpoint",
+            bess_src = self.db_manager.get_or_create_source(bess.name, "bess")
+            schedule = self.db_manager.get_records(
+                "scheduling",
+                source_id=bess_src,
+                metric_id=power_setpoint_met,
                 start_time=timestamp_str,
                 end_time=timestamp_str,
             )
 
             if schedule:
                 # Use scheduled power (positive = discharge, negative = charge)
-                scheduled_power = schedule[0]["value"]
+                scheduled_power = float(schedule[0]["value"])
 
                 if scheduled_power > 0.1:
                     # Discharge
@@ -1108,29 +1122,43 @@ class SimulationEngine:
             - bess_charge
         )
 
+        # Get source and metric IDs
+        port_src = self.db_manager.get_or_create_source("port", "port")
+        power_active_consumption_met = self.db_manager.get_metric_id("power_active_consumption")
+        power_active_production_met = self.db_manager.get_metric_id("power_active_production")
+        bess_discharge_met = self.db_manager.get_metric_id("bess_discharge")
+        bess_charge_met = self.db_manager.get_metric_id("bess_charge")
+        available_power_met = self.db_manager.get_metric_id("available_power")
+        contracted_power_met = self.db_manager.get_metric_id("contracted_power")
+        soc_met = self.db_manager.get_metric_id("soc")
+        state_met = self.db_manager.get_metric_id("state")
+        power_active_met = self.db_manager.get_metric_id("power_active")
+        energy_stored_met = self.db_manager.get_metric_id("energy_stored")
+
         # Port measurements
         measurements.append(
-            (timestamp_str, "port", "power_active_consumption", total_power_used)
+            (timestamp_str, port_src, power_active_consumption_met, str(total_power_used))
         )
         measurements.append(
-            (timestamp_str, "port", "power_active_production", total_pv_production)
+            (timestamp_str, port_src, power_active_production_met, str(total_pv_production))
         )
-        measurements.append((timestamp_str, "port", "bess_discharge", bess_discharge))
-        measurements.append((timestamp_str, "port", "bess_charge", bess_charge))
-        measurements.append((timestamp_str, "port", "available_power", available_power))
+        measurements.append((timestamp_str, port_src, bess_discharge_met, str(bess_discharge)))
+        measurements.append((timestamp_str, port_src, bess_charge_met, str(bess_charge)))
+        measurements.append((timestamp_str, port_src, available_power_met, str(available_power)))
         measurements.append(
-            (timestamp_str, "port", "contracted_power", self.port.contracted_power)
+            (timestamp_str, port_src, contracted_power_met, str(self.port.contracted_power))
         )
 
         # Boat measurements
         for boat in self.port.boats:
-            measurements.append((timestamp_str, boat.name, "soc", boat.soc * 100))
+            boat_src = self.db_manager.get_or_create_source(boat.name, "boat")
+            measurements.append((timestamp_str, boat_src, soc_met, str(boat.soc * 100)))
             measurements.append(
                 (
                     timestamp_str,
-                    boat.name,
-                    "state",
-                    float(boat.state.value == "sailing"),
+                    boat_src,
+                    state_met,
+                    str(float(boat.state.value == "sailing")),
                 )
             )
 
@@ -1146,44 +1174,47 @@ class SimulationEngine:
                 # Motor is off when charging or idle
                 motor_power = 0.0
 
-            measurements.append((timestamp_str, boat.name, "power_active", motor_power))
+            measurements.append((timestamp_str, boat_src, power_active_met, str(motor_power)))
 
         # Charger measurements
         for charger in self.port.chargers:
+            charger_src = self.db_manager.get_or_create_source(charger.name, "charger")
             measurements.append(
-                (timestamp_str, charger.name, "power_active", charger.power)
+                (timestamp_str, charger_src, power_active_met, str(charger.power))
             )
             measurements.append(
                 (
                     timestamp_str,
-                    charger.name,
-                    "state",
-                    float(charger.state.value == "charging"),
+                    charger_src,
+                    state_met,
+                    str(float(charger.state.value == "charging")),
                 )
             )
 
         # PV system measurements
         for pv in self.port.pv_systems:
+            pv_src = self.db_manager.get_or_create_source(pv.name, "pv")
             measurements.append(
                 (
                     timestamp_str,
-                    pv.name,
-                    "power_active_production",
-                    pv.current_production,
+                    pv_src,
+                    power_active_production_met,
+                    str(pv.current_production),
                 )
             )
 
         # BESS measurements
         for bess in self.port.bess_systems:
+            bess_src = self.db_manager.get_or_create_source(bess.name, "bess")
             measurements.append(
-                (timestamp_str, bess.name, "soc", bess.current_soc * 100)
+                (timestamp_str, bess_src, soc_met, str(bess.current_soc * 100))
             )
             measurements.append(
-                (timestamp_str, bess.name, "power_active", bess.current_power)
+                (timestamp_str, bess_src, power_active_met, str(bess.current_power))
             )
             measurements.append(
-                (timestamp_str, bess.name, "energy_stored", bess.get_energy_stored())
+                (timestamp_str, bess_src, energy_stored_met, str(bess.get_energy_stored()))
             )
 
         # Save to database
-        self.db_manager.save_measurements_batch(measurements)
+        self.db_manager.save_records_batch("measurements", measurements)

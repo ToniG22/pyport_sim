@@ -456,26 +456,30 @@ class PortOptimizer:
             result: Optimization result with schedules
         """
         schedules = []
+        power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
         
         # Save charger schedules
+        charger_count = 0
         for charger_name, schedule in result.charger_schedules.items():
+            charger_src = self.db_manager.get_or_create_source(charger_name, "charger")
             for timestamp, power in schedule:
                 ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                schedules.append((ts_str, charger_name, "power_setpoint", power))
+                schedules.append((ts_str, charger_src, power_setpoint_met, str(power)))
+                charger_count += 1
         
         # Save BESS schedules
+        bess_count = 0
         for bess_name, schedule in result.bess_schedules.items():
+            bess_src = self.db_manager.get_or_create_source(bess_name, "bess")
             for timestamp, power in schedule:
                 ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                schedules.append((ts_str, bess_name, "power_setpoint", power))
+                schedules.append((ts_str, bess_src, power_setpoint_met, str(power)))
+                bess_count += 1
         
         # Save to database
         # IMPORTANT: Save ALL schedules, including zero values when boats are sailing
         if schedules:
-            self.db_manager.save_schedules_batch(schedules)
-            # Count schedules by source to verify all timesteps are included
-            charger_count = sum(1 for s in schedules if any(c.name in s[1] for c in self.port.chargers))
-            bess_count = sum(1 for s in schedules if any(b.name in s[1] for b in self.port.bess_systems))
+            self.db_manager.save_records_batch("scheduling", schedules)
             print(f"     ✓ Saved {len(schedules)} schedule entries to database")
             print(f"       (Chargers: {charger_count}, BESS: {bess_count})")
 

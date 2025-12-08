@@ -8,7 +8,8 @@ from typing import Dict, List, Optional
 class OpenMeteoClient:
     """Client for fetching weather data from Open-Meteo API."""
 
-    BASE_URL = "https://api.open-meteo.com/v1/forecast"
+    FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+    HISTORICAL_URL = "https://archive-api.open-meteo.com/v1/archive"
 
     def __init__(self, latitude: float, longitude: float):
         """
@@ -25,11 +26,11 @@ class OpenMeteoClient:
         self, start_date: datetime, days: int = 7
     ) -> Optional[Dict[str, List]]:
         """
-        Fetch weather forecast from Open-Meteo.
+        Fetch weather data from Open-Meteo (forecast or historical based on date).
 
         Args:
-            start_date: Start date for forecast
-            days: Number of days to forecast (max 7 for free tier)
+            start_date: Start date for weather data
+            days: Number of days to fetch (max 7 for free tier forecast)
 
         Returns:
             Dictionary with weather data, or None on error
@@ -41,7 +42,17 @@ class OpenMeteoClient:
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
 
-        # API parameters
+        # Determine if we need historical or forecast API
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        is_historical = start_date.replace(tzinfo=None) < today
+
+        if is_historical:
+            return self._fetch_historical(start_str, end_str)
+        else:
+            return self._fetch_forecast(start_str, end_str)
+
+    def _fetch_forecast(self, start_str: str, end_str: str) -> Optional[Dict[str, List]]:
+        """Fetch from forecast API (for current/future dates)."""
         params = {
             "latitude": self.latitude,
             "longitude": self.longitude,
@@ -65,14 +76,48 @@ class OpenMeteoClient:
         }
 
         try:
-            response = requests.get(self.BASE_URL, params=params, timeout=30)
+            response = requests.get(self.FORECAST_URL, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
-
             return self._parse_response(data)
 
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching weather data: {e}")
+            print(f"Error fetching forecast data: {e}")
+            return None
+
+    def _fetch_historical(self, start_str: str, end_str: str) -> Optional[Dict[str, List]]:
+        """Fetch from historical/archive API (for past dates)."""
+        params = {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "start_date": start_str,
+            "end_date": end_str,
+            "hourly": [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "dew_point_2m",
+                "precipitation",
+                "weather_code",
+                "cloud_cover",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "shortwave_radiation",  # GHI equivalent
+                "direct_radiation",  # DNI equivalent
+                "diffuse_radiation",  # DHI equivalent
+                "direct_normal_irradiance",  # Actual DNI
+            ],
+            "timezone": "UTC",
+        }
+
+        try:
+            print(f"  (Using historical weather API for past date)")
+            response = requests.get(self.HISTORICAL_URL, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            return self._parse_response(data)
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching historical data: {e}")
             return None
 
     def _parse_response(self, data: dict) -> Dict[str, List]:

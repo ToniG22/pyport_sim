@@ -114,6 +114,7 @@ def main():
     # Initialize database
     db_manager = DatabaseManager(settings.db_path)
     db_manager.initialize_schema()
+    db_manager.initialize_default_metrics()
 
     # Create and run simulation
     #  Modify start_date (None = current time) and days (simulation duration)
@@ -121,7 +122,7 @@ def main():
         port=port,
         settings=settings,
         db_manager=db_manager,
-        start_date=None,  #  Set specific start date (datetime) or None for current time
+        start_date="2025-09-01",  #  Set start date as "YYYY-MM-DD" string, datetime, or None for current time
         days=1,  #  Adjust simulation duration (days)
     )
 
