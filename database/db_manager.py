@@ -13,6 +13,8 @@ DEFAULT_METRICS = (
     # Power metrics
     ("power_active_consumption", "kW", "float"),
     ("power_active_production", "kW", "float"),
+    ("power_active_import", "kW", "float"),
+    ("power_active_export", "kW", "float"),
     ("available_power", "kW", "float"),
     ("contracted_power", "kW", "float"),
     ("power_active", "kW", "float"),

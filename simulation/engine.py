@@ -1016,9 +1016,22 @@ class SimulationEngine:
             self._update_bess_default()
 
     def _update_bess_with_schedule(self):
-        """Update BESS using optimized schedules from database."""
+        """
+        Update BESS using optimized schedules from database.
+
+        When schedule says idle or no schedule exists, opportunistically charge
+        from excess PV production. Any remaining excess PV will be exported to grid.
+        """
         timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
         power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
+
+        # Calculate current power flows for opportunistic charging
+        pv_production = sum(pv.current_production for pv in self.port.pv_systems)
+        charger_load = sum(
+            c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
+        )
+        # Excess PV = PV production not being used by chargers
+        excess_pv = max(0.0, pv_production - charger_load)
 
         for bess in self.port.bess_systems:
             bess_src = self.db_manager.get_or_create_source(bess.name, "bess")
@@ -1035,17 +1048,41 @@ class SimulationEngine:
                 scheduled_power = float(schedule[0]["value"])
 
                 if scheduled_power > 0.1:
-                    # Discharge
+                    # Discharge as scheduled
                     bess.discharge(scheduled_power, self.settings.timestep)
                 elif scheduled_power < -0.1:
-                    # Charge
+                    # Charge as scheduled
                     bess.charge(abs(scheduled_power), self.settings.timestep)
                 else:
-                    # Idle
-                    bess.idle()
+                    # Schedule says idle - opportunistically charge from excess PV
+                    if excess_pv > 0.1:
+                        max_charge = bess.get_max_charge_power_available(
+                            self.settings.timestep
+                        )
+                        charge_power = min(excess_pv, max_charge)
+                        if charge_power > 0.1:
+                            bess.charge(charge_power, self.settings.timestep)
+                            excess_pv -= charge_power
+                        else:
+                            bess.idle()
+                    else:
+                        bess.idle()
             else:
-                # No schedule - fallback to default
-                bess.idle()
+                # No schedule - opportunistically charge from excess PV
+                if excess_pv > 0.1:
+                    max_charge = bess.get_max_charge_power_available(
+                        self.settings.timestep
+                    )
+                    charge_power = min(excess_pv, max_charge)
+                    if charge_power > 0.1:
+                        bess.charge(charge_power, self.settings.timestep)
+                        excess_pv -= charge_power
+                    else:
+                        bess.idle()
+                else:
+                    bess.idle()
+        # Note: Any remaining excess_pv after BESS charging will be tracked as
+        # power_active_export in _save_measurements()
 
     def _update_bess_default(self):
         """
@@ -1207,6 +1244,13 @@ class SimulationEngine:
             - total_power_used
         )
 
+        # Calculate grid import/export
+        # Grid balance = (consumption + BESS charging) - (PV production + BESS discharging)
+        # Positive = importing from grid, Negative = exporting to grid
+        grid_balance = total_power_used + bess_charge - total_pv_production - bess_discharge
+        power_active_import = max(0.0, grid_balance)  # Power drawn from grid
+        power_active_export = max(0.0, -grid_balance)  # Power exported to grid
+
         # Get source and metric IDs
         port_src = self.db_manager.get_or_create_source(self.port.name, "port")
         power_active_consumption_met = self.db_manager.get_metric_id(
@@ -1215,6 +1259,8 @@ class SimulationEngine:
         power_active_production_met = self.db_manager.get_metric_id(
             "power_active_production"
         )
+        power_active_import_met = self.db_manager.get_metric_id("power_active_import")
+        power_active_export_met = self.db_manager.get_metric_id("power_active_export")
         bess_discharge_met = self.db_manager.get_metric_id("bess_discharge")
         bess_charge_met = self.db_manager.get_metric_id("bess_charge")
         available_power_met = self.db_manager.get_metric_id("available_power")
@@ -1246,6 +1292,12 @@ class SimulationEngine:
         )
         measurements.append(
             (timestamp_str, port_src, bess_charge_met, str(bess_charge))
+        )
+        measurements.append(
+            (timestamp_str, port_src, power_active_import_met, str(power_active_import))
+        )
+        measurements.append(
+            (timestamp_str, port_src, power_active_export_met, str(power_active_export))
         )
         measurements.append(
             (timestamp_str, port_src, available_power_met, str(available_power))
