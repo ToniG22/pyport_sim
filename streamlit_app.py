@@ -105,12 +105,14 @@ def load_data(
         if source_ids:
             placeholders = ",".join("?" * len(source_ids))
             query += f" AND d.source_id IN ({placeholders})"
-            params.extend(source_ids)
+            # Convert numpy.int64 to Python int for SQLite compatibility
+            params.extend([int(x) for x in source_ids])
 
         if metric_ids:
             placeholders = ",".join("?" * len(metric_ids))
             query += f" AND d.metric_id IN ({placeholders})"
-            params.extend(metric_ids)
+            # Convert numpy.int64 to Python int for SQLite compatibility
+            params.extend([int(x) for x in metric_ids])
 
         if start_time:
             query += " AND d.timestamp >= ?"
@@ -267,7 +269,7 @@ def main():
         st.info("Run the simulation first with `python main.py`")
         return
 
-    selected_db = st.sidebar.selectbox("Select Database", db_files)
+    selected_db = st.sidebar.selectbox("Select Database", db_files, key="db_selector")
 
     # Check if required tables exist
     tables = get_tables(selected_db)
@@ -306,119 +308,119 @@ def main():
 
         if sources_df.empty or metrics_df.empty:
             st.warning("No sources or metrics found in database.")
-            return
-
-        # Controls
-        col1, col2 = st.columns(2)
-
-        with col1:
-            selected_table = st.selectbox(
-                "📁 Data Table",
-                DATA_TABLES,
-                format_func=lambda x: x.capitalize(),
-                help="Select which data table to query",
-            )
-
-        with col2:
-            # Get time range for selected table
-            min_time, max_time = get_time_range(selected_db, selected_table)
-            if min_time and max_time:
-                try:
-                    min_dt = datetime.fromisoformat(min_time.replace("Z", "+00:00"))
-                    max_dt = datetime.fromisoformat(max_time.replace("Z", "+00:00"))
-                    st.info(
-                        f"Time range: {min_dt.strftime('%Y-%m-%d %H:%M')} to {max_dt.strftime('%Y-%m-%d %H:%M')}"
-                    )
-                except:
-                    pass
-
-        # Source selection with type grouping
-        st.subheader("🔌 Select Sources")
-        source_types = sources_df["source_type"].unique().tolist()
-
-        source_cols = st.columns(len(source_types)) if source_types else [st]
-        selected_source_ids = []
-
-        for i, source_type in enumerate(source_types):
-            with source_cols[i]:
-                type_sources = sources_df[sources_df["source_type"] == source_type]
-                st.markdown(f"**{source_type.capitalize()}**")
-                for _, row in type_sources.iterrows():
-                    if st.checkbox(
-                        row["source_name"], key=f"src_{row['source_id']}", value=False
-                    ):
-                        selected_source_ids.append(row["source_id"])
-
-        # Metric selection
-        st.subheader("📏 Select Metrics")
-
-        # Group metrics by prefix for better organization
-        metric_groups = {}
-        for _, row in metrics_df.iterrows():
-            prefix = row["metric_name"].split("_")[0]
-            if prefix not in metric_groups:
-                metric_groups[prefix] = []
-            metric_groups[prefix].append(row)
-
-        metric_cols = st.columns(min(4, len(metric_groups)))
-        selected_metric_ids = []
-
-        for i, (group_name, metrics) in enumerate(metric_groups.items()):
-            with metric_cols[i % len(metric_cols)]:
-                st.markdown(f"**{group_name.capitalize()}**")
-                for metric in metrics:
-                    unit_str = f" ({metric['unit']})" if metric["unit"] else ""
-                    if st.checkbox(
-                        f"{metric['metric_name']}{unit_str}",
-                        key=f"metric_{metric['metric_id']}",
-                        value=False,
-                    ):
-                        selected_metric_ids.append(metric["metric_id"])
-
-        # Load and display data
-        st.markdown("---")
-
-        if not selected_source_ids and not selected_metric_ids:
-            st.info("👆 Select at least one source or metric to view data")
         else:
-            # Load data
-            df = load_data(
-                selected_db,
-                selected_table,
-                source_ids=selected_source_ids if selected_source_ids else None,
-                metric_ids=selected_metric_ids if selected_metric_ids else None,
-            )
+            # Controls
+            col1, col2 = st.columns(2)
 
-            if df is None or df.empty:
-                st.warning("No data matches the selected filters")
-            else:
-                st.success(f"📊 Loaded **{len(df)}** records")
-
-                # Plot
-                fig = create_time_series_plot(df)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-
-                # Statistics
-                with st.expander("📈 Statistics", expanded=False):
-                    df_numeric = df.copy()
-                    df_numeric["value"] = pd.to_numeric(
-                        df_numeric["value"], errors="coerce"
-                    )
-
-                    stats_by_source_metric = df_numeric.groupby(
-                        ["source_name", "metric_name"]
-                    )["value"].agg(["count", "mean", "std", "min", "max"])
-                    st.dataframe(stats_by_source_metric, use_container_width=True)
-
-                # Download button
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download Data as CSV",
-                    data=csv,
-                    file_name=f"{selected_table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
+            with col1:
+                selected_table = st.selectbox(
+                    "📁 Data Table",
+                    DATA_TABLES,
+                    format_func=lambda x: x.capitalize(),
+                    help="Select which data table to query",
+                    key="explorer_table_selector",
                 )
+
+            with col2:
+                # Get time range for selected table
+                min_time, max_time = get_time_range(selected_db, selected_table)
+                if min_time and max_time:
+                    try:
+                        min_dt = datetime.fromisoformat(min_time.replace("Z", "+00:00"))
+                        max_dt = datetime.fromisoformat(max_time.replace("Z", "+00:00"))
+                        st.info(
+                            f"Time range: {min_dt.strftime('%Y-%m-%d %H:%M')} to {max_dt.strftime('%Y-%m-%d %H:%M')}"
+                        )
+                    except:
+                        pass
+
+            # Source selection with type grouping
+            st.subheader("🔌 Select Sources")
+            source_types = sources_df["source_type"].unique().tolist()
+
+            source_cols = st.columns(len(source_types)) if source_types else [st]
+            selected_source_ids = []
+
+            for i, source_type in enumerate(source_types):
+                with source_cols[i]:
+                    type_sources = sources_df[sources_df["source_type"] == source_type]
+                    st.markdown(f"**{source_type.capitalize()}**")
+                    for _, row in type_sources.iterrows():
+                        if st.checkbox(
+                            row["source_name"], key=f"src_{row['source_id']}", value=False
+                        ):
+                            selected_source_ids.append(row["source_id"])
+
+            # Metric selection
+            st.subheader("📏 Select Metrics")
+
+            # Group metrics by prefix for better organization
+            metric_groups = {}
+            for _, row in metrics_df.iterrows():
+                prefix = row["metric_name"].split("_")[0]
+                if prefix not in metric_groups:
+                    metric_groups[prefix] = []
+                metric_groups[prefix].append(row)
+
+            metric_cols = st.columns(min(4, len(metric_groups)))
+            selected_metric_ids = []
+
+            for i, (group_name, metrics) in enumerate(metric_groups.items()):
+                with metric_cols[i % len(metric_cols)]:
+                    st.markdown(f"**{group_name.capitalize()}**")
+                    for metric in metrics:
+                        unit_str = f" ({metric['unit']})" if metric["unit"] else ""
+                        if st.checkbox(
+                            f"{metric['metric_name']}{unit_str}",
+                            key=f"metric_{metric['metric_id']}",
+                            value=False,
+                        ):
+                            selected_metric_ids.append(metric["metric_id"])
+
+            # Load and display data
+            st.markdown("---")
+
+            if not selected_source_ids and not selected_metric_ids:
+                st.info("👆 Select at least one source or metric to view data")
+            else:
+                # Load data
+                df = load_data(
+                    selected_db,
+                    selected_table,
+                    source_ids=selected_source_ids if selected_source_ids else None,
+                    metric_ids=selected_metric_ids if selected_metric_ids else None,
+                )
+
+                if df is None or df.empty:
+                    st.warning("No data matches the selected filters")
+                else:
+                    st.success(f"📊 Loaded **{len(df)}** records")
+
+                    # Plot
+                    fig = create_time_series_plot(df)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    # Statistics
+                    with st.expander("📈 Statistics", expanded=False):
+                        df_numeric = df.copy()
+                        df_numeric["value"] = pd.to_numeric(
+                            df_numeric["value"], errors="coerce"
+                        )
+
+                        stats_by_source_metric = df_numeric.groupby(
+                            ["source_name", "metric_name"]
+                        )["value"].agg(["count", "mean", "std", "min", "max"])
+                        st.dataframe(stats_by_source_metric, use_container_width=True)
+
+                    # Download button
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Data as CSV",
+                        data=csv,
+                        file_name=f"{selected_table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                    )
 
     # Tab 2: Sources & Metrics
     with tab2:

@@ -257,7 +257,7 @@ class PortOptimizer:
             )
             
             # PV production (kW)
-            pv_power_kw = forecast.pv_production_kwh / self.timestep_hours
+            pv_power_kw = forecast.power_active_production_kwh / self.timestep_hours
             
             # Power balance: Grid + PV + BESS >= Chargers
             # Where BESS is positive when discharging (providing power)
@@ -295,7 +295,7 @@ class PortOptimizer:
             bess_net = quicksum(bess_power[bess.name][t] for bess in self.port.bess_systems)
             
             # PV production (kW)
-            pv_power = forecast.pv_production_kwh / self.timestep_hours
+            pv_power = forecast.power_active_production_kwh / self.timestep_hours
             
             # Grid usage = load - PV - BESS_discharge
             # Positive = drawing from grid, Negative = excess (shouldn't happen due to constraints)

@@ -19,7 +19,7 @@ def main():
     # Port configuration
     #  Change port name, contracted power, and location as needed
     port = Port(
-        name="Marina del Sol",
+        name="Funchal",
         contracted_power=40,  #  Adjust contracted power limit (kW)
         lat=32.64542,  #  Set port latitude
         lon=-16.90841,  #  Set port longitude

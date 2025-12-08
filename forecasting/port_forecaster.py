@@ -13,8 +13,8 @@ class EnergyForecast:
     """Energy forecast for a specific time period."""
     
     timestamp: datetime
-    consumption_kwh: float  # Expected consumption in the timestep
-    pv_production_kwh: float  # Expected PV production in the timestep
+    power_active_consumption_kwh: float  # Expected consumption in the timestep
+    power_active_production_kwh: float  # Expected PV production in the timestep
     bess_available_kwh: float  # BESS energy available for discharge
     bess_capacity_kwh: float  # BESS capacity available for charging
     net_balance_kwh: float  # Net energy balance (production - consumption)
@@ -78,21 +78,21 @@ class PortForecaster:
             )
             
             # Forecast consumption (boats on trips + charging)
-            consumption = self._forecast_consumption(timestamp, trip_assignments)
+            power_active_consumption = self._forecast_power_active_consumption(timestamp, trip_assignments)
             
             # Forecast PV production
-            pv_production = self._forecast_pv_production(timestamp, weather_forecasts)
+            power_active_production = self._forecast_power_active_production(timestamp, weather_forecasts)
             
             # Calculate BESS availability (assuming current SOC)
             bess_available, bess_capacity = self._calculate_bess_availability()
             
             # Net balance
-            net_balance = pv_production - consumption
+            net_balance = power_active_production - power_active_consumption
             
             forecast = EnergyForecast(
                 timestamp=timestamp,
-                consumption_kwh=consumption,
-                pv_production_kwh=pv_production,
+                power_active_consumption_kwh=power_active_consumption,
+                power_active_production_kwh=power_active_production,
                 bess_available_kwh=bess_available,
                 bess_capacity_kwh=bess_capacity,
                 net_balance_kwh=net_balance,
@@ -103,13 +103,13 @@ class PortForecaster:
         
         return forecasts
     
-    def _forecast_consumption(
+    def _forecast_power_active_consumption(
         self,
         timestamp: datetime,
         trip_assignments: Dict[str, List[Trip]]
     ) -> float:
         """
-        Forecast energy consumption at a specific timestamp.
+        Forecast active power consumption at a specific timestamp.
         
         Args:
             timestamp: Timestamp to forecast
@@ -118,19 +118,19 @@ class PortForecaster:
         Returns:
             Expected energy consumption in kWh for the timestep
         """
-        total_consumption = 0.0
+        total_power_active_consumption = 0.0
         
         for boat in self.port.boats:
             # Check if boat is on a trip at this timestamp
-            boat_consumption = self._forecast_boat_consumption(
+            boat_power_active_consumption = self._forecast_boat_power_active_consumption(
                 boat, timestamp, trip_assignments.get(boat.name, [])
             )
-            total_consumption += boat_consumption
+            total_power_active_consumption += boat_power_active_consumption
         
         # Note: Charger consumption is based on boat charging needs
         # This will be calculated in the optimization phase
         
-        return total_consumption
+        return total_power_active_consumption
     
     def _forecast_boat_states(
         self,
@@ -206,14 +206,14 @@ class PortForecaster:
         
         return boat_states
     
-    def _forecast_boat_consumption(
+    def _forecast_boat_power_active_consumption(
         self,
         boat: Boat,
         timestamp: datetime,
         trips: List[Trip]
     ) -> float:
         """
-        Forecast a single boat's energy consumption.
+        Forecast a single boat's active power consumption.
         
         Args:
             boat: Boat to forecast
@@ -249,25 +249,25 @@ class PortForecaster:
         # Not on a trip - no motor consumption
         return 0.0
     
-    def _forecast_pv_production(
+    def _forecast_power_active_production(
         self,
         timestamp: datetime,
         weather_forecasts: Dict[str, Dict[str, float]]
     ) -> float:
         """
-        Forecast PV production at a specific timestamp.
+        Forecast active power production at a specific timestamp.
         
         Args:
             timestamp: Timestamp to forecast
             weather_forecasts: Weather forecast data
             
         Returns:
-            Expected PV production in kWh for the timestep
+            Expected power production in kWh for the timestep
         """
         if not self.port.pv_systems:
             return 0.0
         
-        total_production = 0.0
+        total_power_active_production = 0.0
         
         # Get weather conditions for this timestamp
         ts_str = timestamp.strftime("%Y-%m-%d %H:00:00")  # Round to hour
@@ -291,9 +291,9 @@ class PortForecaster:
             
             # Convert to energy for this timestep
             energy_kwh = production_kw * (self.timestep_seconds / 3600)
-            total_production += energy_kwh
+            total_power_active_production += energy_kwh
         
-        return total_production
+        return total_power_active_production
     
     def _calculate_bess_availability(self) -> Tuple[float, float]:
         """
@@ -376,10 +376,12 @@ class PortForecaster:
         """
         forecast_data = []
         
-        # Get source and metric IDs (use same metric names as measurements for consistency)
-        forecast_src = self.db_manager.get_or_create_source(forecast_type, "forecast")
-        consumption_met = self.db_manager.get_metric_id("power_active_consumption")
-        pv_production_met = self.db_manager.get_metric_id("power_active_production")
+        # Get source IDs - use port as source for port-level aggregated metrics
+        port_src = self.db_manager.get_or_create_source(self.port.name, "port")
+        
+        # Get metric IDs (use same metric names as measurements for consistency)
+        power_active_consumption_met = self.db_manager.get_metric_id("power_active_consumption")
+        power_active_production_met = self.db_manager.get_metric_id("power_active_production")
         bess_available_met = self.db_manager.get_metric_id("bess_available")
         bess_capacity_met = self.db_manager.get_metric_id("bess_capacity")
         net_balance_met = self.db_manager.get_metric_id("net_balance")
@@ -388,12 +390,12 @@ class PortForecaster:
         for forecast in forecasts:
             ts_str = forecast.timestamp.strftime("%Y-%m-%d %H:%M:%S")
             
-            # Save each forecast metric (values are energy in kWh for the timestep)
-            forecast_data.append((ts_str, forecast_src, consumption_met, str(forecast.consumption_kwh)))
-            forecast_data.append((ts_str, forecast_src, pv_production_met, str(forecast.pv_production_kwh)))
-            forecast_data.append((ts_str, forecast_src, bess_available_met, str(forecast.bess_available_kwh)))
-            forecast_data.append((ts_str, forecast_src, bess_capacity_met, str(forecast.bess_capacity_kwh)))
-            forecast_data.append((ts_str, forecast_src, net_balance_met, str(forecast.net_balance_kwh)))
+            # Save port-level aggregated metrics with port source
+            forecast_data.append((ts_str, port_src, power_active_consumption_met, str(forecast.power_active_consumption_kwh)))
+            forecast_data.append((ts_str, port_src, power_active_production_met, str(forecast.power_active_production_kwh)))
+            forecast_data.append((ts_str, port_src, bess_available_met, str(forecast.bess_available_kwh)))
+            forecast_data.append((ts_str, port_src, bess_capacity_met, str(forecast.bess_capacity_kwh)))
+            forecast_data.append((ts_str, port_src, net_balance_met, str(forecast.net_balance_kwh)))
             
             # Save boat state forecasts (metric="state", source=boat_name)
             # Use same format as measurements: 1.0 for sailing, 0.0 otherwise
@@ -416,21 +418,21 @@ class PortForecaster:
             print("  No forecasts to display")
             return
         
-        total_consumption = sum(f.consumption_kwh for f in forecasts)
-        total_production = sum(f.pv_production_kwh for f in forecasts)
+        total_power_active_consumption = sum(f.power_active_consumption_kwh for f in forecasts)
+        total_power_active_production = sum(f.power_active_production_kwh for f in forecasts)
         avg_bess_available = sum(f.bess_available_kwh for f in forecasts) / len(forecasts)
         
         print(f"\n  📊 Energy Forecast Summary (24h):")
-        print(f"     Total Consumption: {total_consumption:.2f} kWh")
-        print(f"     Total PV Production: {total_production:.2f} kWh")
+        print(f"     Total Consumption: {total_power_active_consumption:.2f} kWh")
+        print(f"     Total Production: {total_power_active_production:.2f} kWh")
         print(f"     Avg BESS Available: {avg_bess_available:.2f} kWh")
-        print(f"     Net Balance: {total_production - total_consumption:.2f} kWh")
+        print(f"     Net Balance: {total_power_active_production - total_power_active_consumption:.2f} kWh")
         
         # Peak consumption time
-        peak_forecast = max(forecasts, key=lambda f: f.consumption_kwh)
-        print(f"     Peak Consumption: {peak_forecast.consumption_kwh:.2f} kWh at {peak_forecast.timestamp.strftime('%H:%M')}")
+        peak_forecast = max(forecasts, key=lambda f: f.power_active_consumption_kwh)
+        print(f"     Peak Consumption: {peak_forecast.power_active_consumption_kwh:.2f} kWh at {peak_forecast.timestamp.strftime('%H:%M')}")
         
         # Peak production time
-        peak_production = max(forecasts, key=lambda f: f.pv_production_kwh)
-        print(f"     Peak Production: {peak_production.pv_production_kwh:.2f} kWh at {peak_production.timestamp.strftime('%H:%M')}")
+        peak_production = max(forecasts, key=lambda f: f.power_active_production_kwh)
+        print(f"     Peak Production: {peak_production.power_active_production_kwh:.2f} kWh at {peak_production.timestamp.strftime('%H:%M')}")
 

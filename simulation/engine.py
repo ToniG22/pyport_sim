@@ -931,7 +931,7 @@ class SimulationEngine:
         # Save to database
         forecasts = []
         openmeteo_src = self.db_manager.get_or_create_source("openmeteo", "weather")
-        
+
         for i, ts in enumerate(timestamps):
             ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -942,7 +942,9 @@ class SimulationEngine:
 
                 if i < len(values) and values[i] is not None:
                     metric_id = self.db_manager.get_metric_id(metric)
-                    forecasts.append((ts_str, openmeteo_src, metric_id, str(float(values[i]))))
+                    forecasts.append(
+                        (ts_str, openmeteo_src, metric_id, str(float(values[i])))
+                    )
 
             # Store in memory for quick access
             if i < len(timestamps):
@@ -1123,9 +1125,13 @@ class SimulationEngine:
         )
 
         # Get source and metric IDs
-        port_src = self.db_manager.get_or_create_source("port", "port")
-        power_active_consumption_met = self.db_manager.get_metric_id("power_active_consumption")
-        power_active_production_met = self.db_manager.get_metric_id("power_active_production")
+        port_src = self.db_manager.get_or_create_source(self.port.name, "port")
+        power_active_consumption_met = self.db_manager.get_metric_id(
+            "power_active_consumption"
+        )
+        power_active_production_met = self.db_manager.get_metric_id(
+            "power_active_production"
+        )
         bess_discharge_met = self.db_manager.get_metric_id("bess_discharge")
         bess_charge_met = self.db_manager.get_metric_id("bess_charge")
         available_power_met = self.db_manager.get_metric_id("available_power")
@@ -1137,16 +1143,37 @@ class SimulationEngine:
 
         # Port measurements
         measurements.append(
-            (timestamp_str, port_src, power_active_consumption_met, str(total_power_used))
+            (
+                timestamp_str,
+                port_src,
+                power_active_consumption_met,
+                str(total_power_used),
+            )
         )
         measurements.append(
-            (timestamp_str, port_src, power_active_production_met, str(total_pv_production))
+            (
+                timestamp_str,
+                port_src,
+                power_active_production_met,
+                str(total_pv_production),
+            )
         )
-        measurements.append((timestamp_str, port_src, bess_discharge_met, str(bess_discharge)))
-        measurements.append((timestamp_str, port_src, bess_charge_met, str(bess_charge)))
-        measurements.append((timestamp_str, port_src, available_power_met, str(available_power)))
         measurements.append(
-            (timestamp_str, port_src, contracted_power_met, str(self.port.contracted_power))
+            (timestamp_str, port_src, bess_discharge_met, str(bess_discharge))
+        )
+        measurements.append(
+            (timestamp_str, port_src, bess_charge_met, str(bess_charge))
+        )
+        measurements.append(
+            (timestamp_str, port_src, available_power_met, str(available_power))
+        )
+        measurements.append(
+            (
+                timestamp_str,
+                port_src,
+                contracted_power_met,
+                str(self.port.contracted_power),
+            )
         )
 
         # Boat measurements
@@ -1174,7 +1201,9 @@ class SimulationEngine:
                 # Motor is off when charging or idle
                 motor_power = 0.0
 
-            measurements.append((timestamp_str, boat_src, power_active_met, str(motor_power)))
+            measurements.append(
+                (timestamp_str, boat_src, power_active_met, str(motor_power))
+            )
 
         # Charger measurements
         for charger in self.port.chargers:
@@ -1213,7 +1242,12 @@ class SimulationEngine:
                 (timestamp_str, bess_src, power_active_met, str(bess.current_power))
             )
             measurements.append(
-                (timestamp_str, bess_src, energy_stored_met, str(bess.get_energy_stored()))
+                (
+                    timestamp_str,
+                    bess_src,
+                    energy_stored_met,
+                    str(bess.get_energy_stored()),
+                )
             )
 
         # Save to database
