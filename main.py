@@ -103,7 +103,7 @@ def main():
         timestep=900,  #  Adjust timestep duration (seconds, 900 = 15 minutes)
         mode=SimulationMode.BATCH,  #  Change to SimulationMode.REALTIME for real-time simulation
         db_path="port_simulation.db",  #  Change database file path if needed
-        use_optimizer=True,  #  Set to False to disable optimization (SCIP)
+        use_optimizer=False,  #  Set to False to disable optimization (SCIP)
     )
 
     print(f"\n⚙️  Mode: Optimized scheduling (SCIP)")
