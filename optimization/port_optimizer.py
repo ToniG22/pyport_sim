@@ -5,9 +5,35 @@ from typing import Dict, List, Tuple
 from dataclasses import dataclass
 
 from pyscipopt import Model, quicksum
-from models import Port, Boat, Charger, BESS, BoatState
+from models import Port, Boat, BoatState
 from database import DatabaseManager
-from forecasting import PortForecaster, EnergyForecast
+from forecasting import EnergyForecast
+
+
+# ===========================================================================
+# CONFIGURATION CONSTANTS FOR OPTIMIZATION CONSTRAINTS
+# ===========================================================================
+
+# BESS constraints
+BESS_SOC_MIN = 0.10          # Minimum SOC (10%) - don't discharge below this
+BESS_SOC_MAX = 0.90          # Maximum SOC (90%) - don't charge above this
+BESS_END_OF_DAY_TARGET = 0.50  # Target SOC at end of day for next day flexibility
+BESS_END_OF_DAY_TOLERANCE = 0.20  # Allow ±20% deviation from target (30%-70% range)
+BESS_RAMP_RATE_FACTOR = 0.50  # Max power change per timestep as fraction of max power
+BESS_CYCLING_PENALTY = 0.01  # Small penalty per kW of power change to reduce cycling
+
+# Boat constraints
+BOAT_SOC_SAFETY_RESERVE = 0.10  # Keep 10% reserve for safety/emergencies
+BOAT_MIN_SOC_FOR_TRIP = 0.15  # Additional buffer above trip requirement
+
+# Charger constraints
+CHARGER_MIN_POWER_FACTOR = 0.10  # Minimum operating power as fraction of max (10%)
+
+# Objective weights
+WEIGHT_BOAT_SHORTFALL = 100000  # HUGE penalty for not meeting boat energy needs
+WEIGHT_GRID_COST = 1.0         # Weight for grid energy cost
+WEIGHT_BESS_CYCLING = 0.001    # Small weight to discourage unnecessary cycling
+WEIGHT_END_OF_DAY_SOC = 10.0   # Moderate penalty for ending day at wrong SOC
 
 
 @dataclass
@@ -53,9 +79,12 @@ class PortOptimizer:
         """
         Optimize charger and BESS schedules for a day.
         
-        This is a SIMPLIFIED optimization model that focuses on:
+        This optimization model focuses on:
         - Minimizing grid usage by using PV and BESS optimally
-        - Ensuring boats have enough charge for trips
+        - Ensuring boats have enough charge for trips (with safety buffer)
+        - Respecting BESS operating constraints (SOC limits, ramp rates)
+        - Not exceeding contracted grid power
+        - Minimizing energy costs based on time-of-use tariffs
         
         Args:
             forecast_date: Date to optimize for
@@ -65,7 +94,7 @@ class PortOptimizer:
         Returns:
             OptimizationResult with optimal schedules
         """
-        print(f"     🔧 Optimizing energy schedule (with tariff pricing)...")
+        print("     🔧 Optimizing energy schedule (with constraints)...")
         
         # Create optimization model
         model = Model("port_energy_optimization")
@@ -77,99 +106,104 @@ class PortOptimizer:
         timesteps = list(range(T))
         
         # ===================================================================
-        # SIMPLIFIED DECISION VARIABLES
+        # DECISION VARIABLES
         # ===================================================================
         
-        # BESS power at each timestep (simplified: just net power)
-        # Positive = discharge, Negative = charge
-        bess_power = {}
-        bess_soc = {}
+        # BESS variables
+        bess_power = {}       # Net power: positive=discharge, negative=charge
+        bess_soc = {}         # State of charge (0-1)
+        bess_charge = {}      # Charging power (>=0)
+        bess_discharge = {}   # Discharging power (>=0)
+        bess_is_charging = {} # Binary: 1 if charging, 0 if discharging
         
         for bess in self.port.bess_systems:
             bess_power[bess.name] = {}
             bess_soc[bess.name] = {}
+            bess_charge[bess.name] = {}
+            bess_discharge[bess.name] = {}
+            bess_is_charging[bess.name] = {}
+            
+            # Use BESS-specific limits if available, otherwise use defaults
+            soc_min = getattr(bess, 'soc_min', BESS_SOC_MIN)
+            soc_max = getattr(bess, 'soc_max', BESS_SOC_MAX)
             
             for t in timesteps:
+                # Net power variable
                 bess_power[bess.name][t] = model.addVar(
                     name=f"bess_power_{bess.name}_t{t}",
                     vtype="C",
                     lb=-bess.max_charge_power,  # Negative = charging
                     ub=bess.max_discharge_power  # Positive = discharging
                 )
+                
+                # SOC variable - constrained to operating range
                 bess_soc[bess.name][t] = model.addVar(
                     name=f"bess_soc_{bess.name}_t{t}",
                     vtype="C",
-                    lb=bess.soc_min,
-                    ub=bess.soc_max
+                    lb=soc_min,
+                    ub=soc_max
+                )
+                
+                # Separate charge/discharge variables for efficiency handling
+                bess_charge[bess.name][t] = model.addVar(
+                    name=f"bess_charge_{bess.name}_t{t}",
+                    vtype="C",
+                    lb=0,
+                    ub=bess.max_charge_power
+                )
+                
+                bess_discharge[bess.name][t] = model.addVar(
+                    name=f"bess_discharge_{bess.name}_t{t}",
+                    vtype="C",
+                    lb=0,
+                    ub=bess.max_discharge_power
+                )
+                
+                # Binary variable to prevent simultaneous charge/discharge
+                bess_is_charging[bess.name][t] = model.addVar(
+                    name=f"bess_is_charging_{bess.name}_t{t}",
+                    vtype="B"  # Binary
                 )
         
-        # Charger power (simplified: just power, not assignment)
+        # Charger power variables
         charger_power = {}
+        charger_is_on = {}  # Binary: 1 if charger is operating
+        
         for charger in self.port.chargers:
             charger_power[charger.name] = {}
+            charger_is_on[charger.name] = {}
+            
+            min_power = charger.max_power * CHARGER_MIN_POWER_FACTOR
+            
             for t in timesteps:
                 charger_power[charger.name][t] = model.addVar(
                     name=f"charger_{charger.name}_t{t}",
-                    vtype="C",  # Continuous
+                    vtype="C",
                     lb=0,
                     ub=charger.max_power
                 )
+                
+                # Binary variable for charger on/off (for minimum power constraint)
+                charger_is_on[charger.name][t] = model.addVar(
+                    name=f"charger_on_{charger.name}_t{t}",
+                    vtype="B"
+                )
         
-        # 1. BESS SOC dynamics
-        for bess in self.port.bess_systems:
-            for t in timesteps:
-                if t == 0:
-                    # Initial BESS SOC
-                    model.addCons(
-                        bess_soc[bess.name][t] == bess.current_soc,
-                        name=f"initial_bess_soc_{bess.name}"
-                    )
-                else:
-                    # BESS SOC change based on power
-                    # Negative power = charging (increases SOC)
-                    # Positive power = discharging (decreases SOC)
-                    power = bess_power[bess.name][t-1]
-                    
-                    # We need to handle charging and discharging differently due to efficiency
-                    # For linear programming, we use separate charge and discharge variables
-                    # Charge power (positive when charging)
-                    charge_power = model.addVar(
-                        name=f"bess_charge_{bess.name}_t{t-1}",
-                        vtype="C",
-                        lb=0,
-                        ub=bess.max_charge_power
-                    )
-                    
-                    # Discharge power (positive when discharging)
-                    discharge_power = model.addVar(
-                        name=f"bess_discharge_{bess.name}_t{t-1}",
-                        vtype="C",
-                        lb=0,
-                        ub=bess.max_discharge_power
-                    )
-                    
-                    # Constraint: net power = discharge - charge
-                    model.addCons(
-                        power == discharge_power - charge_power,
-                        name=f"bess_power_split_{bess.name}_t{t-1}"
-                    )
-                    
-                    # SOC change accounting for efficiency:
-                    # When charging: energy stored = charge_power * time * efficiency
-                    # When discharging: energy removed = discharge_power * time / efficiency
-                    energy_stored = charge_power * self.timestep_hours * bess.efficiency
-                    energy_removed = discharge_power * self.timestep_hours / bess.efficiency
-                    
-                    # SOC change (normalized by capacity)
-                    soc_change = (energy_stored - energy_removed) / bess.capacity
-                    
-                    model.addCons(
-                        bess_soc[bess.name][t] == bess_soc[bess.name][t-1] + soc_change,
-                        name=f"bess_soc_dynamics_{bess.name}_t{t}"
-                    )
+        # Grid import variable (for contracted power constraint)
+        grid_import = {}
+        for t in timesteps:
+            grid_import[t] = model.addVar(
+                name=f"grid_import_t{t}",
+                vtype="C",
+                lb=0,
+                ub=self.port.contracted_power  # Hard limit on grid import
+            )
+        
+        # ===================================================================
+        # CONSTRAINTS
+        # ===================================================================
         
         # Pre-compute boat availability at each timestep
-        # boat_available[boat_name][t] = True if boat is available (not sailing) at timestep t
         boat_available = {}
         for boat in self.port.boats:
             boat_available[boat.name] = {}
@@ -187,48 +221,127 @@ class PortOptimizer:
                 for boat in self.port.boats
             )
         
-        # 2. CRITICAL: Ensure boats get charged before trips
-        # This is THE PRIORITY - boats must be able to complete their trips
-        # IMPORTANT: Only charge when boats are NOT sailing (available at port)
-        boat_energy_shortfall = {}
-        for boat in self.port.boats:
-            trips = trip_assignments.get(boat.name, [])
-            if trips:
-                # Calculate TOTAL energy needed for all trips
-                total_trip_energy = sum(trip.estimate_energy_required(boat.k) for trip in trips)
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 1: BESS SOC dynamics with efficiency
+        # ---------------------------------------------------------------------
+        for bess in self.port.bess_systems:
+            soc_min = getattr(bess, 'soc_min', BESS_SOC_MIN)
+            soc_max = getattr(bess, 'soc_max', BESS_SOC_MAX)
+            
+            for t in timesteps:
+                if t == 0:
+                    # Initial BESS SOC (clamped to operating range)
+                    initial_soc = max(soc_min, min(soc_max, bess.current_soc))
+                    model.addCons(
+                        bess_soc[bess.name][t] == initial_soc,
+                        name=f"initial_bess_soc_{bess.name}"
+                    )
+                else:
+                    # SOC dynamics: charging adds energy, discharging removes energy
+                    # Charging: energy_in = charge_power * time * efficiency
+                    # Discharging: energy_out = discharge_power * time / efficiency
+                    energy_stored = bess_charge[bess.name][t-1] * self.timestep_hours * bess.efficiency
+                    energy_removed = bess_discharge[bess.name][t-1] * self.timestep_hours / bess.efficiency
+                    
+                    soc_change = (energy_stored - energy_removed) / bess.capacity
+                    
+                    model.addCons(
+                        bess_soc[bess.name][t] == bess_soc[bess.name][t-1] + soc_change,
+                        name=f"bess_soc_dynamics_{bess.name}_t{t}"
+                    )
                 
-                # Energy boat currently has
-                current_energy = boat.soc * boat.battery_capacity
-                
-                # Energy needed to charge to full + complete trips
-                energy_needed = boat.battery_capacity - current_energy + total_trip_energy
-                
-                # Total energy provided by ALL chargers to this boat
-                # ONLY when boat is NOT sailing (available at port)
-                # Use pre-computed availability to filter timesteps
-                available_timesteps = [t for t in timesteps if boat_available[boat.name][t]]
-                total_charging_energy = quicksum(
-                    charger_power[charger.name][t] * charger.efficiency * self.timestep_hours
-                    for charger in self.port.chargers
-                    for t in available_timesteps
-                )
-                
-                # Create slack variable for energy shortfall
-                boat_energy_shortfall[boat.name] = model.addVar(
-                    name=f"shortfall_{boat.name}",
-                    vtype="C",
-                    lb=0
-                )
-                
-                # Constraint: charging + shortfall >= needed
-                # We want shortfall to be 0 (penalized heavily in objective)
+                # Power balance: net power = discharge - charge
                 model.addCons(
-                    total_charging_energy + boat_energy_shortfall[boat.name] >= energy_needed,
-                    name=f"boat_{boat.name}_energy_requirement"
+                    bess_power[bess.name][t] == bess_discharge[bess.name][t] - bess_charge[bess.name][t],
+                    name=f"bess_power_balance_{bess.name}_t{t}"
                 )
         
-        # 2b. Constraint: Chargers can only operate when boats are available (not sailing)
-        # This prevents chargers from running when boats are out on trips
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 2: Prevent simultaneous BESS charge and discharge (big-M)
+        # ---------------------------------------------------------------------
+        for bess in self.port.bess_systems:
+            M = max(bess.max_charge_power, bess.max_discharge_power) + 1
+            
+            for t in timesteps:
+                # If charging (is_charging=1), discharge must be 0
+                model.addCons(
+                    bess_discharge[bess.name][t] <= M * (1 - bess_is_charging[bess.name][t]),
+                    name=f"no_discharge_when_charging_{bess.name}_t{t}"
+                )
+                
+                # If discharging (is_charging=0), charge must be 0
+                model.addCons(
+                    bess_charge[bess.name][t] <= M * bess_is_charging[bess.name][t],
+                    name=f"no_charge_when_discharging_{bess.name}_t{t}"
+                )
+        
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 3: BESS power ramp rate limits
+        # ---------------------------------------------------------------------
+        for bess in self.port.bess_systems:
+            max_ramp = max(bess.max_charge_power, bess.max_discharge_power) * BESS_RAMP_RATE_FACTOR
+            
+            for t in timesteps[1:]:  # Start from t=1
+                # Limit power increase
+                model.addCons(
+                    bess_power[bess.name][t] - bess_power[bess.name][t-1] <= max_ramp,
+                    name=f"bess_ramp_up_{bess.name}_t{t}"
+                )
+                
+                # Limit power decrease
+                model.addCons(
+                    bess_power[bess.name][t-1] - bess_power[bess.name][t] <= max_ramp,
+                    name=f"bess_ramp_down_{bess.name}_t{t}"
+                )
+        
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 4: BESS end-of-day SOC target (soft constraint via objective)
+        # We add a slack variable and penalize deviation from target
+        # ---------------------------------------------------------------------
+        bess_end_soc_deviation = {}
+        for bess in self.port.bess_systems:
+            target_soc = getattr(bess, 'initial_soc', BESS_END_OF_DAY_TARGET)
+            
+            # Slack variable for deviation from target
+            bess_end_soc_deviation[bess.name] = model.addVar(
+                name=f"bess_end_soc_dev_{bess.name}",
+                vtype="C",
+                lb=0
+            )
+            
+            # Absolute deviation constraint (linearized)
+            last_t = timesteps[-1]
+            model.addCons(
+                bess_end_soc_deviation[bess.name] >= bess_soc[bess.name][last_t] - target_soc,
+                name=f"bess_end_soc_dev_pos_{bess.name}"
+            )
+            model.addCons(
+                bess_end_soc_deviation[bess.name] >= target_soc - bess_soc[bess.name][last_t],
+                name=f"bess_end_soc_dev_neg_{bess.name}"
+            )
+        
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 5: Charger minimum operating power (when on)
+        # ---------------------------------------------------------------------
+        for charger in self.port.chargers:
+            min_power = charger.max_power * CHARGER_MIN_POWER_FACTOR
+            
+            for t in timesteps:
+                # If charger is on, power must be at least min_power
+                model.addCons(
+                    charger_power[charger.name][t] >= min_power * charger_is_on[charger.name][t],
+                    name=f"charger_min_power_{charger.name}_t{t}"
+                )
+                
+                # If charger is off, power must be 0
+                model.addCons(
+                    charger_power[charger.name][t] <= charger.max_power * charger_is_on[charger.name][t],
+                    name=f"charger_max_when_on_{charger.name}_t{t}"
+                )
+        
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 6: Chargers can only operate when boats are available
+        # ---------------------------------------------------------------------
         for charger in self.port.chargers:
             for t in timesteps:
                 if not any_boat_available[t]:
@@ -238,99 +351,156 @@ class PortOptimizer:
                         name=f"charger_{charger.name}_off_when_all_sailing_t{t}"
                     )
         
-        # 3. Power balance constraint
-        # Note: When boats are sailing, they consume energy from their own batteries,
-        # not from chargers, so charger power should be 0 (enforced above)
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 7: Boat energy requirements with safety buffer
+        # ---------------------------------------------------------------------
+        boat_energy_shortfall = {}
+        for boat in self.port.boats:
+            trips = trip_assignments.get(boat.name, [])
+            if trips:
+                # Calculate TOTAL energy needed for all trips + safety buffer
+                total_trip_energy = sum(trip.estimate_energy_required(boat.k) for trip in trips)
+                
+                # Energy boat currently has
+                current_energy = boat.soc * boat.battery_capacity
+                
+                # Safety reserve energy (keep BOAT_SOC_SAFETY_RESERVE in battery)
+                safety_reserve = BOAT_SOC_SAFETY_RESERVE * boat.battery_capacity
+                
+                # Additional buffer above trip requirement
+                trip_buffer = BOAT_MIN_SOC_FOR_TRIP * boat.battery_capacity
+                
+                # Total energy needed = fill battery + trip energy + buffers
+                energy_needed = (
+                    boat.battery_capacity - current_energy  # Fill to 100%
+                    + total_trip_energy                      # Trip consumption
+                    + safety_reserve                         # Keep reserve
+                    + trip_buffer                            # Additional buffer
+                )
+                
+                # Clamp to reasonable maximum (don't ask for more than 2x battery capacity)
+                energy_needed = min(energy_needed, 2 * boat.battery_capacity)
+                
+                # Total energy provided by chargers to this boat (when available)
+                available_timesteps = [t for t in timesteps if boat_available[boat.name][t]]
+                total_charging_energy = quicksum(
+                    charger_power[charger.name][t] * charger.efficiency * self.timestep_hours
+                    for charger in self.port.chargers
+                    for t in available_timesteps
+                )
+                
+                # Slack variable for energy shortfall
+                boat_energy_shortfall[boat.name] = model.addVar(
+                    name=f"shortfall_{boat.name}",
+                    vtype="C",
+                    lb=0
+                )
+                
+                # Constraint: charging + shortfall >= needed
+                model.addCons(
+                    total_charging_energy + boat_energy_shortfall[boat.name] >= energy_needed,
+                    name=f"boat_{boat.name}_energy_requirement"
+                )
+        
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 8: Grid import limit (contracted power)
+        # ---------------------------------------------------------------------
         for t in timesteps:
             forecast = energy_forecasts[t]
             
-            # Total charger power needed (should be 0 when all boats are sailing)
+            # Total charger power
             total_charger_power = quicksum(
                 charger_power[charger.name][t]
                 for charger in self.port.chargers
             )
             
-            # Total BESS power (positive = discharge, negative = charge)
-            total_bess_power = quicksum(
-                bess_power[bess.name][t]
+            # BESS charging power (counts as load)
+            total_bess_charging = quicksum(
+                bess_charge[bess.name][t]
+                for bess in self.port.bess_systems
+            )
+            
+            # BESS discharging power (provides power, reduces grid need)
+            total_bess_discharging = quicksum(
+                bess_discharge[bess.name][t]
                 for bess in self.port.bess_systems
             )
             
             # PV production (kW)
             pv_power_kw = forecast.power_active_production_kwh / self.timestep_hours
             
-            # Power balance: Grid + PV + BESS >= Chargers
-            # Where BESS is positive when discharging (providing power)
-            # When boats are sailing, charger_power should be 0, so this constraint
-            # allows PV and BESS to be used for other purposes or stored
+            # Grid import = total load - local generation - BESS discharge
+            # Grid import + PV + BESS_discharge >= chargers + BESS_charge
             model.addCons(
-                self.port.contracted_power + pv_power_kw + total_bess_power >= total_charger_power,
+                grid_import[t] >= total_charger_power + total_bess_charging - pv_power_kw - total_bess_discharging,
+                name=f"grid_import_balance_t{t}"
+            )
+            
+            # Grid import cannot exceed contracted power (already in variable bounds)
+            # But add explicit constraint for clarity
+            model.addCons(
+                grid_import[t] <= self.port.contracted_power,
+                name=f"grid_import_limit_t{t}"
+            )
+        
+        # ---------------------------------------------------------------------
+        # CONSTRAINT 9: Power balance (ensure supply meets demand)
+        # ---------------------------------------------------------------------
+        for t in timesteps:
+            forecast = energy_forecasts[t]
+            
+            total_charger_power = quicksum(
+                charger_power[charger.name][t]
+                for charger in self.port.chargers
+            )
+            
+            total_bess_power = quicksum(
+                bess_power[bess.name][t]
+                for bess in self.port.bess_systems
+            )
+            
+            pv_power_kw = forecast.power_active_production_kwh / self.timestep_hours
+            
+            # Power balance: Grid + PV + BESS_discharge >= Chargers + BESS_charge
+            # With BESS_power = discharge - charge, this becomes:
+            # Grid + PV + BESS_power >= Chargers
+            model.addCons(
+                grid_import[t] + pv_power_kw + total_bess_power >= total_charger_power,
                 name=f"power_balance_t{t}"
             )
         
         # ===================================================================
-        # OBJECTIVE FUNCTION: Prioritize boat charging, then minimize cost-weighted grid usage
+        # OBJECTIVE FUNCTION
         # ===================================================================
         
-        # PRIMARY: Penalize energy shortfall for boats (MUST charge boats for trips!)
-        boat_shortfall_penalty = quicksum(boat_energy_shortfall.values()) * 100000  # HUGE penalty
+        # Term 1: HUGE penalty for boat energy shortfalls (MUST charge boats!)
+        boat_shortfall_penalty = quicksum(boat_energy_shortfall.values()) * WEIGHT_BOAT_SHORTFALL
         
-        # SECONDARY: Minimize cost-weighted grid energy usage
-        # This encourages:
-        # - Charging BESS during low-price periods (to store energy for later)
-        # - Discharging BESS during high-price periods (to avoid buying expensive grid power)
-        # - Using grid power during low-price periods
+        # Term 2: Grid energy cost (time-of-use pricing)
         total_grid_cost = 0
         for t in timesteps:
-            forecast = energy_forecasts[t]
             timestamp = forecast_date + timedelta(seconds=t * self.timestep_seconds)
-            
-            # Get tariff price for this timestep
             price_per_kwh = self.port.get_tariff_price(timestamp)
             
-            # Charger load (from grid)
-            charger_load = quicksum(charger_power[charger.name][t] for charger in self.port.chargers)
-            
-            # BESS net power (positive = discharge, negative = charge)
-            bess_net = quicksum(bess_power[bess.name][t] for bess in self.port.bess_systems)
-            
-            # PV production (kW)
-            pv_power = forecast.power_active_production_kwh / self.timestep_hours
-            
-            # Grid usage = load - PV - BESS_discharge
-            # Positive = drawing from grid, Negative = excess (shouldn't happen due to constraints)
-            grid_power = charger_load - pv_power - bess_net
-            
-            # Grid energy (kWh) for this timestep
-            grid_energy = grid_power * self.timestep_hours
-            
-            # Cost-weighted grid energy
-            # The optimizer will naturally:
-            # - Charge BESS when prices are low (bess_net < 0 increases grid_power, but price is low)
-            # - Discharge BESS when prices are high (bess_net > 0 decreases grid_power, avoiding high costs)
-            # Since grid_energy can theoretically be negative (excess PV), we need to handle that
-            # For linear programming, we create a variable for grid energy purchased (always >= 0)
-            grid_energy_purchased = model.addVar(
-                name=f"grid_energy_purchased_t{t}",
-                vtype="C",
-                lb=0
-            )
-            
-            # Constraint: grid_energy_purchased >= grid_energy
-            # Since we're minimizing cost, it will equal max(0, grid_energy)
-            model.addCons(
-                grid_energy_purchased >= grid_energy,
-                name=f"grid_energy_purchased_constraint_t{t}"
-            )
-            
-            # Cost for this timestep: grid energy purchased * price
-            timestep_cost = grid_energy_purchased * price_per_kwh
-            
-            total_grid_cost += timestep_cost
+            # Cost = grid import * price * timestep_hours
+            grid_energy_kwh = grid_import[t] * self.timestep_hours
+            total_grid_cost += grid_energy_kwh * price_per_kwh * WEIGHT_GRID_COST
         
-        # Combined objective: HEAVILY prioritize boat charging, then minimize costs
+        # Term 3: BESS cycling penalty (reduce wear and tear)
+        bess_cycling_cost = 0
+        for bess in self.port.bess_systems:
+            for t in timesteps:
+                # Penalize both charging and discharging to reduce unnecessary cycling
+                bess_cycling_cost += (
+                    bess_charge[bess.name][t] + bess_discharge[bess.name][t]
+                ) * WEIGHT_BESS_CYCLING
+        
+        # Term 4: End-of-day SOC deviation penalty
+        end_soc_penalty = quicksum(bess_end_soc_deviation.values()) * WEIGHT_END_OF_DAY_SOC
+        
+        # Combined objective
         model.setObjective(
-            boat_shortfall_penalty + total_grid_cost,
+            boat_shortfall_penalty + total_grid_cost + bess_cycling_cost + end_soc_penalty,
             "minimize"
         )
         
@@ -386,16 +556,12 @@ class PortOptimizer:
                 for boat in self.port.boats:
                     boat_plan[boat.name] = []
                 
-                print(f"     ✓ Optimization complete: {status}")
-                print(f"       Objective value: {obj_value:.2f}")
+                # Print optimization summary
+                self._print_optimization_summary(
+                    status, obj_value, energy_shortfalls, 
+                    model, bess_soc, bess_end_soc_deviation, timesteps
+                )
                 
-                # Warn about energy shortfalls
-                if energy_shortfalls:
-                    print(f"     ⚠️  Energy shortfalls detected:")
-                    for boat_name, shortfall_kwh in energy_shortfalls.items():
-                        boat = next(b for b in self.port.boats if b.name == boat_name)
-                        shortfall_pct = (shortfall_kwh / boat.battery_capacity) * 100
-                        print(f"       {boat_name}: {shortfall_kwh:.2f} kWh ({shortfall_pct:.1f}% of battery)")
             except Exception as e:
                 print(f"     ⚠️  Error extracting solution: {e}")
                 obj_value = float('inf')
@@ -411,6 +577,35 @@ class PortOptimizer:
             boat_charging_plan=boat_plan,
             energy_shortfalls=energy_shortfalls
         )
+    
+    def _print_optimization_summary(
+        self, 
+        status: str, 
+        obj_value: float, 
+        energy_shortfalls: Dict[str, float],
+        model: Model,
+        bess_soc: Dict,
+        bess_end_soc_deviation: Dict,
+        timesteps: List[int]
+    ):
+        """Print a summary of the optimization results."""
+        print(f"     ✓ Optimization complete: {status}")
+        print(f"       Objective value: {obj_value:.2f}")
+        
+        # Print BESS end-of-day SOC
+        for bess in self.port.bess_systems:
+            end_soc = model.getVal(bess_soc[bess.name][timesteps[-1]])
+            deviation = model.getVal(bess_end_soc_deviation[bess.name])
+            target = getattr(bess, 'initial_soc', BESS_END_OF_DAY_TARGET)
+            print(f"       {bess.name} end SOC: {end_soc:.1%} (target: {target:.0%}, deviation: {deviation:.1%})")
+        
+        # Warn about energy shortfalls
+        if energy_shortfalls:
+            print("     ⚠️  Energy shortfalls detected:")
+            for boat_name, shortfall_kwh in energy_shortfalls.items():
+                boat = next(b for b in self.port.boats if b.name == boat_name)
+                shortfall_pct = (shortfall_kwh / boat.battery_capacity) * 100
+                print(f"       {boat_name}: {shortfall_kwh:.2f} kWh ({shortfall_pct:.1f}% of battery)")
     
     def _estimate_trip_consumption_soc(
         self,
@@ -482,4 +677,3 @@ class PortOptimizer:
             self.db_manager.save_records_batch("scheduling", schedules)
             print(f"     ✓ Saved {len(schedules)} schedule entries to database")
             print(f"       (Chargers: {charger_count}, BESS: {bess_count})")
-
