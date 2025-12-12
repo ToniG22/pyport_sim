@@ -203,11 +203,11 @@ class SimulationEngine:
             # 2. Generate energy forecast at midnight (00:00):
             self._generate_energy_forecast()
 
-        # 3. Update PV production based on weather
-        self._update_pv_production()
-
-        # 4. Check and handle trip schedules
+        # 3. Check and handle trip schedules
         self._handle_trips()
+
+        # 4. Update PV production based on weather
+        self._update_pv_production()
 
         # 5. Check which boats need charging and assign to chargers
         self._assign_boats_to_chargers()
