@@ -1,1 +1,1 @@
-"""Test configurations for port simulation."""
+"""Tests for the electric port simulator."""
