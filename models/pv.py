@@ -147,12 +147,14 @@ class PV:
         # For now, use a simplified model
         # In a full implementation, this would use proper transposition models
 
-        # Angle of incidence factor (simplified)
+        # Angle of incidence factor for south-facing panel
         tilt_rad = math.radians(self.tilt)
         elevation_rad = math.radians(solar_elevation)
 
         # Direct component on tilted surface
-        cos_incident_angle = max(0, math.cos(tilt_rad - elevation_rad))
+        # For a south-facing panel at solar noon: cos(θ) = sin(elevation + tilt)
+        # This gives maximum when sun elevation + tilt = 90°
+        cos_incident_angle = max(0, math.sin(elevation_rad + tilt_rad))
         direct_component = dni * cos_incident_angle
 
         # Diffuse component (isotropic sky model)
