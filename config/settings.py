@@ -12,6 +12,13 @@ class SimulationMode(Enum):
     BATCH = "batch"
 
 
+class OptimizerType(Enum):
+    """Optimizer types for charging schedule optimization."""
+    
+    COST = "cost"  # Cost-minimization optimizer (original PortOptimizer)
+    RELIABILITY = "reliability"  # Reliability-focused optimizer (ReliabilityOptimizer)
+
+
 @dataclass
 class Settings:
     """
@@ -21,13 +28,15 @@ class Settings:
         timestep: Simulation timestep in seconds
         mode: Simulation mode (real-time or batch)
         db_path: Path to SQLite database file
-        use_optimizer: Whether to use SCIP optimization for scheduling
+        use_optimizer: Whether to use optimization for scheduling
+        optimizer_type: Type of optimizer to use (cost or reliability)
     """
 
     timestep: int = 900  # Default: 15 minutes
     mode: SimulationMode = SimulationMode.BATCH
     db_path: str = "port_simulation.db"
     use_optimizer: bool = False  # Default: use rule-based control
+    optimizer_type: OptimizerType = OptimizerType.RELIABILITY  # Default: reliability-focused
 
     def __post_init__(self):
         """Validate settings."""

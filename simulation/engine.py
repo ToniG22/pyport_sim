@@ -6,11 +6,11 @@ from typing import Optional, Dict, List, Union
 
 from models import Port, BoatState, ChargerState, Trip
 from database import DatabaseManager
-from config import Settings, SimulationMode
+from config import Settings, SimulationMode, OptimizerType
 from simulation.trip_manager import TripManager
 from weather import OpenMeteoClient
 from forecasting import PortForecaster
-from optimization import PortOptimizer
+from optimization import PortOptimizer, ReliabilityOptimizer
 
 
 class SimulationEngine:
@@ -93,9 +93,14 @@ class SimulationEngine:
         # Initialize optimizer (if enabled)
         self.optimizer = None
         self.use_optimizer = settings.use_optimizer
+        self.optimizer_type = getattr(settings, 'optimizer_type', OptimizerType.RELIABILITY)
         if self.use_optimizer:
-            self.optimizer = PortOptimizer(port, db_manager, settings.timestep)
-            print(f"\n🔧 Optimizer enabled (SCIP)")
+            if self.optimizer_type == OptimizerType.RELIABILITY:
+                self.optimizer = ReliabilityOptimizer(port, db_manager, settings.timestep)
+                print(f"\n🔧 Optimizer enabled (Reliability-focused)")
+            else:
+                self.optimizer = PortOptimizer(port, db_manager, settings.timestep)
+                print(f"\n🔧 Optimizer enabled (SCIP Cost-based)")
 
         # Store latest forecasts for optimizer
         self.latest_energy_forecasts = []
@@ -298,9 +303,13 @@ class SimulationEngine:
             self.current_datetime, self.latest_energy_forecasts, trip_assignments
         )
 
-        # Handle energy shortfalls gracefully
-        if result.energy_shortfalls:
+        # Handle energy shortfalls gracefully (only for cost optimizer)
+        if hasattr(result, 'energy_shortfalls') and result.energy_shortfalls:
             self._handle_energy_shortfalls(result, trip_assignments)
+        
+        # For reliability optimizer, track boats with issues
+        if hasattr(result, 'boats_cancelled'):
+            self.boats_with_shortfalls = set(result.boats_cancelled + result.boats_delayed)
 
         # Save schedules to database
         self.optimizer.save_schedules_to_db(result)
@@ -353,9 +362,13 @@ class SimulationEngine:
                 self.current_datetime, remaining_forecasts, trip_assignments
             )
 
-            # Handle energy shortfalls gracefully
-            if result.energy_shortfalls:
+            # Handle energy shortfalls gracefully (only for cost optimizer)
+            if hasattr(result, 'energy_shortfalls') and result.energy_shortfalls:
                 self._handle_energy_shortfalls(result, trip_assignments)
+            
+            # For reliability optimizer, track boats with issues
+            if hasattr(result, 'boats_cancelled'):
+                self.boats_with_shortfalls = set(result.boats_cancelled + result.boats_delayed)
 
             # Save new schedules
             self.optimizer.save_schedules_to_db(result)
@@ -623,127 +636,85 @@ class SimulationEngine:
         else:
             self._assign_boats_to_chargers_default()
 
+    def _get_current_power_usage(self) -> float:
+        """Calculate current total power being used by chargers."""
+        return sum(c.power for c in self.port.chargers if c.state == ChargerState.CHARGING)
+    
+    def _get_available_power(self) -> float:
+        """Calculate available power within contracted limit."""
+        used_power = self._get_current_power_usage()
+        pv_production = sum(pv.current_production for pv in self.port.pv_systems)
+        
+        # BESS discharge capacity (if available)
+        bess_available = sum(
+            bess.get_max_discharge_power_available(self.settings.timestep)
+            for bess in self.port.bess_systems
+        )
+        
+        # Available = contracted + PV + BESS - used
+        return self.port.contracted_power + pv_production + bess_available - used_power
+
     def _assign_boats_to_chargers_with_schedule(self):
-        """Assign boats to chargers using optimized schedules from database."""
-        timestamp_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
-        power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
-
-        # Get charger power setpoints from schedule
-        for charger in self.port.chargers:
-            charger_src = self.db_manager.get_or_create_source(charger.name, "charger")
-            schedule = self.db_manager.get_records(
-                "scheduling",
-                source_id=charger_src,
-                metric_id=power_setpoint_met,
-                start_time=timestamp_str,
-                end_time=timestamp_str,
+        """
+        AGGRESSIVE charging assignment using optimizer schedules.
+        
+        Strategy: Charge ALL boats as fast as possible to 100% SOC.
+        - Use maximum power on all chargers
+        - Prioritize boats with lowest SOC and delayed trips
+        - Never stop charging until boat is full
+        - Respect contracted power limit
+        """
+        # Get boats that need charging (not sailing, not full, not already charging)
+        boats_needing_charge = [
+            b for b in self.port.boats
+            if b.state != BoatState.SAILING and b.soc < 0.99 and b.name not in self.boat_charger_map
+        ]
+        
+        # Sort by priority: delayed trips first, then lowest SOC first
+        boats_needing_charge.sort(
+            key=lambda b: (
+                0 if b.name in self.delayed_trips else 1,
+                0 if b.name in self.boats_with_shortfalls else 1,
+                b.soc  # Lowest SOC first
             )
-
-            if schedule:
-                # Use scheduled power
-                scheduled_power = float(schedule[0]["value"])
-
-                if scheduled_power > 0.1 and charger.state == ChargerState.IDLE:
-                    # Find a boat that needs charging
-                    # Prioritize boats with delayed trips, then boats with energy shortfalls
-                    boats_needing_charge = [
-                        b
-                        for b in self.port.boats
-                        if (
-                            b.state != BoatState.SAILING
-                            and b.soc < 0.99
-                            and b.name not in self.boat_charger_map
-                        )
-                    ]
-
-                    # Sort: boats with delayed trips first, then boats with shortfalls, then by SOC (lowest first)
-                    boats_needing_charge.sort(
-                        key=lambda b: (
-                            0 if b.name in self.delayed_trips else 1,
-                            0 if b.name in self.boats_with_shortfalls else 1,
-                            b.soc,
-                        )
-                    )
-
-                    for boat in boats_needing_charge:
-                        # For boats with delayed trips or shortfalls, use maximum power regardless of schedule
-                        if (
-                            boat.name in self.delayed_trips
-                            or boat.name in self.boats_with_shortfalls
-                        ):
-                            power_to_use = charger.max_power
-                        else:
-                            power_to_use = min(scheduled_power, charger.max_power)
-
-                        # Assign charger to boat
-                        self.boat_charger_map[boat.name] = charger.name
-                        boat.state = BoatState.CHARGING
-                        charger.state = ChargerState.CHARGING
-                        charger.power = power_to_use
-                        charger.connected_boat = boat.name
-
-                        if self.current_datetime.minute % 15 == 0:
-                            if boat.name in self.delayed_trips:
-                                priority_note = " (priority - delayed trip)"
-                            elif boat.name in self.boats_with_shortfalls:
-                                priority_note = " (priority - shortfall)"
-                            else:
-                                priority_note = " (scheduled)"
-                            print(
-                                f"  ⚡ {boat.name} started charging at {charger.name}{priority_note}, SOC={boat.soc:.1%}"
-                            )
-                        break
-                elif scheduled_power < 0.1 and charger.state == ChargerState.CHARGING:
-                    # Schedule says stop charging, but check if boat has delayed trip or shortfall
-                    if charger.connected_boat in self.boat_charger_map:
-                        boat_name = charger.connected_boat
-                        boat = next(b for b in self.port.boats if b.name == boat_name)
-
-                        # Don't stop charging if boat has delayed trip and still needs charge
-                        if boat_name in self.delayed_trips and boat.soc < 0.99:
-                            # Continue charging at max power for delayed trip
-                            charger.power = charger.max_power
-                            continue
-
-                        # Don't stop charging if boat has shortfall and still needs charge
-                        if boat_name in self.boats_with_shortfalls and boat.soc < 0.99:
-                            # Continue charging at max power
-                            charger.power = charger.max_power
-                            continue
-
-                        # Otherwise, stop charging as scheduled
-                        boat.state = BoatState.IDLE
-                        charger.state = ChargerState.IDLE
-                        charger.power = 0.0
-                        charger.connected_boat = None
-                        del self.boat_charger_map[boat_name]
-            else:
-                # No schedule - check if any boat with delayed trip needs charging
-                if charger.state == ChargerState.IDLE:
-                    boats_with_delayed_trips = [
-                        b
-                        for b in self.port.boats
-                        if (
-                            b.name in self.delayed_trips
-                            and b.state != BoatState.SAILING
-                            and b.soc < 0.99
-                            and b.name not in self.boat_charger_map
-                        )
-                    ]
-
-                    if boats_with_delayed_trips:
-                        # Prioritize boats with delayed trips - assign charger
-                        boat = min(boats_with_delayed_trips, key=lambda b: b.soc)
-                        self.boat_charger_map[boat.name] = charger.name
-                        boat.state = BoatState.CHARGING
-                        charger.state = ChargerState.CHARGING
-                        charger.power = charger.max_power
-                        charger.connected_boat = boat.name
-
-                        if self.current_datetime.minute % 15 == 0:
-                            print(
-                                f"  ⚡ {boat.name} started charging at {charger.name} (priority - delayed trip, no schedule), SOC={boat.soc:.1%}"
-                            )
+        )
+        
+        # Get available chargers
+        available_chargers = [c for c in self.port.chargers if c.state == ChargerState.IDLE]
+        
+        # Calculate available power
+        available_power = self._get_available_power()
+        
+        # Assign boats to chargers aggressively
+        for boat in boats_needing_charge:
+            if not available_chargers:
+                break
+            
+            # Check if we have enough power for another charger
+            if available_power < available_chargers[0].max_power * 0.5:
+                break
+            
+            charger = available_chargers.pop(0)
+            power_to_use = min(charger.max_power, available_power)
+            
+            # Assign charger to boat at maximum power
+            self.boat_charger_map[boat.name] = charger.name
+            boat.state = BoatState.CHARGING
+            charger.state = ChargerState.CHARGING
+            charger.power = power_to_use
+            charger.connected_boat = boat.name
+            
+            # Update available power
+            available_power -= power_to_use
+            
+            if self.current_datetime.minute % 15 == 0:
+                if boat.name in self.delayed_trips:
+                    priority_note = " (PRIORITY - delayed)"
+                elif boat.name in self.boats_with_shortfalls:
+                    priority_note = " (PRIORITY - shortfall)"
+                else:
+                    priority_note = ""
+                print(f"  ⚡ {boat.name} → {charger.name}{priority_note}, SOC={boat.soc:.1%}, Power={power_to_use:.0f}kW")
 
     def _override_schedules_for_shortfall_boat(self, boat_name: str, result):
         """

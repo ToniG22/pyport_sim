@@ -179,3 +179,5 @@ pyrightconfig.json
 
 # Output files from tests
 output/
+
+comparison_results/
