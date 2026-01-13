@@ -775,7 +775,8 @@ class SimulationEngine:
         - First come, first served: boats with delayed trips get priority, then
           boats are served in arrival order (list order)
         - Use max power available on each charger
-        - If there's not enough energy capacity, boats idle waiting for a charger
+        - NO contracted power limit - boats charge freely at max charger power
+        - This allows measuring the impact of unlimited charging on results
         """
         # Get boats that need charging (not sailing, not fully charged)
         boats_needing_charge = [
@@ -797,53 +798,27 @@ class SimulationEngine:
             c for c in self.port.chargers if c.state == ChargerState.IDLE
         ]
 
-        # Calculate available power at port
-        # Formula: available = contracted_power + renewables + usable_bess - used_power
-        used_power = sum(
-            c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
-        )
-        pv_production = sum(pv.current_production for pv in self.port.pv_systems)
-
-        # BESS usable capacity = potential discharge power available
-        bess_usable_capacity = sum(
-            bess.get_max_discharge_power_available(self.settings.timestep)
-            for bess in self.port.bess_systems
-        )
-
-        # Available power = grid capacity + PV production + BESS usable capacity - current consumption
-        available_power = (
-            self.port.contracted_power + pv_production + bess_usable_capacity - used_power
-        )
-
-        # Assign boats to chargers (FCFS with max power)
+        # Assign boats to chargers (FCFS with max power, no contracted power limit)
         for boat in boats_needing_charge:
             if not available_chargers:
                 # No chargers available - boat idles waiting
                 break
 
             charger = available_chargers.pop(0)
-            power_needed = charger.max_power
 
-            if available_power >= power_needed:
-                # Assign boat to charger at max power
-                self.boat_charger_map[boat.name] = charger.name
-                boat.state = BoatState.CHARGING
-                charger.state = ChargerState.CHARGING
-                charger.power = charger.max_power
-                charger.connected_boat = boat.name
-                available_power -= charger.max_power
+            # Assign boat to charger at max power (no power limit check)
+            self.boat_charger_map[boat.name] = charger.name
+            boat.state = BoatState.CHARGING
+            charger.state = ChargerState.CHARGING
+            charger.power = charger.max_power
+            charger.connected_boat = boat.name
 
-                # Log charging start
-                if self.current_datetime.minute % 15 == 0:
-                    priority_note = " (priority - delayed trip)" if boat.name in self.delayed_trips else ""
-                    print(
-                        f"  ⚡ {boat.name} started charging at {charger.name}{priority_note}, SOC={boat.soc:.1%}"
-                    )
-            else:
-                # Not enough power available - charger goes back to available pool
-                # and boat idles waiting for energy
-                available_chargers.insert(0, charger)
-                # Boat remains idle - will try again next timestep
+            # Log charging start
+            if self.current_datetime.minute % 15 == 0:
+                priority_note = " (priority - delayed trip)" if boat.name in self.delayed_trips else ""
+                print(
+                    f"  ⚡ {boat.name} started charging at {charger.name}{priority_note}, SOC={boat.soc:.1%}"
+                )
 
     def _update_charging(self):
         """Update battery charge for boats that are charging."""
@@ -1083,16 +1058,14 @@ class SimulationEngine:
 
     def _update_bess_with_pv(self, pv_production: float, charger_load: float):
         """
-        Update BESS when paired with PV/renewables.
+        Update BESS when paired with PV/renewables (default mode, no optimizer).
 
-        - Charge when PV generation exceeds load
-        - Discharge when load exceeds generation or for peak shaving
+        - Charge when PV generation exceeds load (store excess solar)
+        - NO peak shaving (no contracted power limit in default mode)
+        - Grid is assumed unlimited, so no discharge needed for peak shaving
         """
         # PV surplus = excess PV not used by chargers
         pv_surplus = pv_production - charger_load
-
-        # Power deficit = load exceeds what grid + PV can provide
-        power_deficit = charger_load - (self.port.contracted_power + pv_production)
 
         for bess in self.port.bess_systems:
             if pv_surplus > 0:
@@ -1105,29 +1078,17 @@ class SimulationEngine:
                     pv_surplus -= charge_power
                 else:
                     bess.idle()
-
-            elif power_deficit > 0:
-                # Peak shaving: discharge BESS to cover the shortfall
-                max_discharge = bess.get_max_discharge_power_available(
-                    self.settings.timestep
-                )
-                discharge_power = min(power_deficit, max_discharge)
-
-                if discharge_power > 0.1:
-                    bess.discharge(discharge_power, self.settings.timestep)
-                    power_deficit -= discharge_power
-                else:
-                    bess.idle()
             else:
-                # No surplus and no deficit - idle
+                # No surplus - idle (no peak shaving in default mode)
                 bess.idle()
 
     def _update_bess_without_pv(self, charger_load: float):
         """
-        Update BESS when NOT paired with PV/renewables.
+        Update BESS when NOT paired with PV/renewables (default mode, no optimizer).
 
         - Charge when electricity is cheaper AND boats are not charging
-        - Discharge when load exceeds contracted power (peak shaving)
+        - NO peak shaving (no contracted power limit in default mode)
+        - Grid is assumed unlimited for charging
         """
         # Get current tariff price
         current_price = self.port.get_tariff_price(self.current_datetime)
@@ -1147,36 +1108,18 @@ class SimulationEngine:
         # Check if any boats are currently charging
         boats_charging = charger_load > 0.1
 
-        # Power deficit = load exceeds contracted power (need peak shaving)
-        power_deficit = charger_load - self.port.contracted_power
-
         for bess in self.port.bess_systems:
-            if power_deficit > 0:
-                # Peak shaving: discharge BESS to stay within contracted power
-                max_discharge = bess.get_max_discharge_power_available(
-                    self.settings.timestep
-                )
-                discharge_power = min(power_deficit, max_discharge)
-
-                if discharge_power > 0.1:
-                    bess.discharge(discharge_power, self.settings.timestep)
-                    power_deficit -= discharge_power
-                else:
-                    bess.idle()
-
-            elif is_cheap_period and not boats_charging:
+            if is_cheap_period and not boats_charging:
                 # Cheap electricity and no boats charging - charge BESS from grid
-                # Use remaining grid capacity (contracted power - current load)
-                available_grid_power = self.port.contracted_power - charger_load
+                # No grid capacity limit in default mode - use max charge rate
                 max_charge = bess.get_max_charge_power_available(self.settings.timestep)
-                charge_power = min(available_grid_power, max_charge)
 
-                if charge_power > 0.1:
-                    bess.charge(charge_power, self.settings.timestep)
+                if max_charge > 0.1:
+                    bess.charge(max_charge, self.settings.timestep)
                 else:
                     bess.idle()
             else:
-                # Expensive period or boats charging - idle (save energy for peak shaving)
+                # Expensive period or boats charging - idle
                 bess.idle()
 
     def _save_measurements(self):
