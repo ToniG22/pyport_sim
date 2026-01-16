@@ -2,6 +2,6 @@
 
 from .port_optimizer import PortOptimizer
 from .reliability_optimizer import ReliabilityOptimizer
+from .realiability_first_optimizer import ReliabilityFirstOptimizer
 
-__all__ = ["PortOptimizer", "ReliabilityOptimizer"]
-
+__all__ = ["PortOptimizer", "ReliabilityOptimizer", "ReliabilityFirstOptimizer"]

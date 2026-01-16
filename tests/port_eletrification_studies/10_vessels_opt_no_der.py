@@ -229,7 +229,7 @@ def main():
         mode=SimulationMode.BATCH,  #  Change to SimulationMode.REALTIME for real-time simulation
         db_path="10_vessels_opt_no_der.db",  #  Change database file path if needed
         use_optimizer=True,  #  Set to False to disable optimization
-        optimizer_type=OptimizerType.RELIABILITY,  # Use reliability-focused optimizer
+        optimizer_type=OptimizerType.RELIABILITY_FIRST,  # Use reliability-focused optimizer
     )
 
     # Initialize database

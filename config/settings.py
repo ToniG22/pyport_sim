@@ -14,9 +14,12 @@ class SimulationMode(Enum):
 
 class OptimizerType(Enum):
     """Optimizer types for charging schedule optimization."""
-    
+
     COST = "cost"  # Cost-minimization optimizer (original PortOptimizer)
     RELIABILITY = "reliability"  # Reliability-focused optimizer (ReliabilityOptimizer)
+    RELIABILITY_FIRST = (
+        "reliability_first"  # Reliability-first optimizer (ReliabilityFirstOptimizer)
+    )
 
 
 @dataclass
@@ -36,7 +39,9 @@ class Settings:
     mode: SimulationMode = SimulationMode.BATCH
     db_path: str = "port_simulation.db"
     use_optimizer: bool = False  # Default: use rule-based control
-    optimizer_type: OptimizerType = OptimizerType.RELIABILITY  # Default: reliability-focused
+    optimizer_type: OptimizerType = (
+        OptimizerType.RELIABILITY_FIRST
+    )  # Default: reliability-focused
 
     def __post_init__(self):
         """Validate settings."""
