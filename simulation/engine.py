@@ -650,6 +650,8 @@ class SimulationEngine:
         # Check if we're using optimizer schedules
         if self.use_optimizer:
             self._assign_boats_to_chargers_with_schedule()
+        elif hasattr(self.settings, 'power_limit_mode') and self.settings.power_limit_mode:
+            self._assign_boats_to_chargers_power_limited()
         else:
             self._assign_boats_to_chargers_default()
 
@@ -917,9 +919,95 @@ class SimulationEngine:
                     if boat.name in self.delayed_trips
                     else ""
                 )
-                print(
-                    f"  ⚡ {boat.name} started charging at {charger.name}{priority_note}, SOC={boat.soc:.1%}"
+            print(
+                f"  ⚡ {boat.name} started charging at {charger.name}{priority_note}, SOC={boat.soc:.1%}"
+            )
+
+    def _assign_boats_to_chargers_power_limited(self):
+        """
+        Assign boats to chargers with power limiting to respect contracted power.
+        
+        Baseline behavior with power limit enforcement:
+        - First come, first served: boats with delayed trips get priority, then
+          boats are served in arrival order (list order)
+        - Enforces contracted power limit by capping total charging power
+        - Distributes available power proportionally when limit is hit
+        - This provides a baseline to compare against optimizer performance
+        """
+        # Get boats that need charging (not sailing, not fully charged)
+        boats_needing_charge = [
+            b
+            for b in self.port.boats
+            if b.state != BoatState.SAILING
+            and b.soc < 0.99
+            and b.name not in self.boat_charger_map
+        ]
+
+        # FCFS ordering: prioritize boats with delayed trips, then maintain list order
+        boats_needing_charge.sort(
+            key=lambda b: (0 if b.name in self.delayed_trips else 1)
+        )
+
+        # Get available chargers
+        available_chargers = [
+            c for c in self.port.chargers if c.state == ChargerState.IDLE
+        ]
+
+        # Calculate available power (contracted power - current usage)
+        current_power_used = self._get_current_power_usage()
+        pv_production = sum(pv.current_production for pv in self.port.pv_systems)
+        available_power = self.port.contracted_power + pv_production - current_power_used
+
+        # Assign boats to chargers (FCFS with power limit enforcement)
+        for boat in boats_needing_charge:
+            if not available_chargers:
+                # No chargers available - boat idles waiting
+                break
+
+            if available_power <= 0.1:
+                # No power available - cannot charge more boats
+                break
+
+            charger = available_chargers.pop(0)
+
+            # Assign boat to charger, respecting power limit
+            # Use minimum of charger max power and available power
+            charge_power = min(charger.max_power, available_power)
+
+            self.boat_charger_map[boat.name] = charger.name
+            boat.state = BoatState.CHARGING
+            charger.state = ChargerState.CHARGING
+            charger.power = charge_power
+            charger.connected_boat = boat.name
+
+            # Update available power
+            available_power -= charge_power
+
+            # Log charging start
+            if self.current_datetime.minute % 15 == 0:
+                priority_note = (
+                    " (priority - delayed trip)"
+                    if boat.name in self.delayed_trips
+                    else ""
                 )
+                power_note = f" [{charge_power:.1f}kW]" if charge_power < charger.max_power else ""
+                print(
+                    f"  ⚡ {boat.name} started charging at {charger.name}{priority_note}{power_note}, SOC={boat.soc:.1%}"
+                )
+
+        # If power limit is hit, proportionally reduce charging power for already-charging boats
+        # This ensures we don't exceed the limit
+        total_power_used = self._get_current_power_usage()
+        max_total_power = self.port.contracted_power + pv_production
+
+        if total_power_used > max_total_power + 0.1:  # Small tolerance for floating point
+            # Need to reduce power proportionally
+            scale_factor = max_total_power / total_power_used
+            
+            for boat_name, charger_name in self.boat_charger_map.items():
+                charger = next(c for c in self.port.chargers if c.name == charger_name)
+                if charger.state == ChargerState.CHARGING:
+                    charger.power = charger.power * scale_factor
 
     def _update_charging(self):
         """Update battery charge for boats that are charging."""

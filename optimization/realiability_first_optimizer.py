@@ -1,32 +1,14 @@
 """
-Reliability-first port charging optimizer (SCIP MILP) — FIXED VERSION.
+Reliability-first port charging optimizer (SCIP MILP) — SCALABLE VERSION.
 
-Fixes included vs your current version:
-1) Deadline timestep semantics: configurable inclusion of the departure timestep.
-   - If trips depart at the START of the timestep (most common): EXCLUDE departure timestep.
-   - If trips depart at the END of the timestep window: INCLUDE departure timestep.
-   Default here matches your engine: trips trigger when hour==start_hour and minute < timestep/60,
-   i.e., at the START → exclude the departure timestep.
+Optimized for large-scale problems (20+ boats):
+1) Per-boat energy constraints without explicit boat-charger assignments
+2) Uses auxiliary continuous variables to track energy per boat
+3) Boat availability constraints limit charging when boats are sailing
+4) Cost-aware charging when no trips scheduled
+5) Efficient DER utilization
 
-2) Charging efficiency / taper safety:
-   - Applies an efficiency factor to required energy (if boats expose charge_efficiency),
-     otherwise uses a conservative default.
-   - Keeps ENERGY_MARGIN_FRAC to cover taper / rounding.
-
-3) Robust trip slot indexing:
-   - Finds exact (hour, minute) indices; fails loudly (prints warning) if not found.
-
-4) BESS: keep your aggregated net-power model, but:
-   - Use energy_forecasts[t].bess_available_kwh/capacity_kwh (t=0) as before.
-   - Preserve split vars bdis/bchg for linear energy budgets.
-
-Important note (modeling trade-off):
-- This remains an aggregated model (fleet-level energy-by-deadline), not per-boat SOC trajectories.
-  It is usually enough to fix your "50% reliability" failure mode and is fast/scalable.
-
-Expected outcome:
-- 5 vessels, contracted 80 kW, no DER should reach 100% reliability,
-  assuming physically feasible (it is, based on your earlier baseline behavior).
+This version scales much better than the binary assignment model.
 """
 
 from __future__ import annotations
@@ -37,7 +19,7 @@ from typing import Dict, List, Tuple, Optional
 
 from pyscipopt import Model, quicksum
 
-from models import Port, Trip
+from models import Port, Trip, BoatState
 from database import DatabaseManager
 from forecasting import EnergyForecast
 
@@ -52,18 +34,18 @@ TRIP_SLOTS: List[Tuple[int, int]] = [
 ]
 
 # Small margin to reduce SOC edge cases / tapering effects
-ENERGY_MARGIN_FRAC = 0.05  # bumped to 5% for robustness
+ENERGY_MARGIN_FRAC = 0.05  # 5% margin for robustness
 
 # If True, energy delivered during the departure timestep counts toward the deadline.
-# Your engine starts trips at the start of the timestep window → keep False.
 INCLUDE_DEPARTURE_TIMESTEP_IN_DEADLINE = False
 
 # Conservative charging efficiency if boat doesn't expose one
 DEFAULT_CHARGE_EFF = 0.95
 
 # Objective weights
-W_EARLY = 0.05  # slightly stronger early bias to satisfy deadlines comfortably
+W_EARLY = 0.05  # Early charging bias to satisfy deadlines comfortably
 W_TOTAL = 1.0
+W_COST = 0.1  # Cost minimization when no trips scheduled
 
 
 # -----------------------------------------------------------------------------
@@ -94,9 +76,6 @@ class ReliabilityFirstOptimizer:
         self.timestep_seconds = timestep_seconds
         self.dt_h = timestep_seconds / 3600.0
 
-    # -----------------------------
-    # Public API expected by engine
-    # -----------------------------
     def optimize_daily_schedule(
         self,
         forecast_date: datetime,
@@ -106,11 +85,13 @@ class ReliabilityFirstOptimizer:
         T = len(energy_forecasts)
         timesteps = range(T)
 
-        model = Model("reliability_first_fixed")
+        model = Model("reliability_first_scalable")
         model.hideOutput()
         model.setRealParam("limits/time", 30.0)
 
         num_chargers = len(self.port.chargers)
+        num_boats = len(self.port.boats)
+        
         if num_chargers == 0:
             return ReliabilityFirstOptimizationResult(
                 status="no_chargers",
@@ -132,6 +113,30 @@ class ReliabilityFirstOptimizer:
             )
 
         # -----------------------------
+        # Boat availability per timestep
+        # -----------------------------
+        boat_available: Dict[int, Dict[int, bool]] = {}
+        boats_available_count: Dict[int, int] = {}  # timestep -> count of available boats
+        for b_idx, boat in enumerate(self.port.boats):
+            boat_available[b_idx] = {}
+            for t in timesteps:
+                state = energy_forecasts[t].boat_states.get(boat.name, BoatState.IDLE)
+                boat_available[b_idx][t] = (state != BoatState.SAILING)
+        
+        for t in timesteps:
+            boats_available_count[t] = sum(
+                1 for b_idx in range(num_boats) if boat_available[b_idx][t]
+            )
+
+        # -----------------------------
+        # Tariff prices per timestep
+        # -----------------------------
+        tariff_price: Dict[int, float] = {}
+        for t in timesteps:
+            timestamp = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+            tariff_price[t] = self.port.get_tariff_price(timestamp)
+
+        # -----------------------------
         # Decision vars
         # -----------------------------
         # Charger power per charger and timestep (kW)
@@ -141,6 +146,28 @@ class ReliabilityFirstOptimizer:
             ub = float(self.port.chargers[c].max_power)
             for t in timesteps:
                 p[c][t] = model.addVar(name=f"p_{c}_{t}", vtype="C", lb=0.0, ub=ub)
+
+        # Energy delivered per boat per timestep (kWh) - continuous auxiliary variable
+        # This tracks how much energy each boat receives without explicit charger assignment
+        boat_energy: Dict[int, Dict[int, object]] = {}  # boat_idx -> timestep -> energy_kWh
+        max_boat_energy_per_timestep = max(
+            float(c.max_power) * self.dt_h for c in self.port.chargers
+        )
+        
+        for b_idx in range(num_boats):
+            boat_energy[b_idx] = {}
+            for t in timesteps:
+                if boat_available[b_idx][t]:
+                    # Boat can receive energy from available chargers
+                    boat_energy[b_idx][t] = model.addVar(
+                        name=f"boat_energy_{b_idx}_{t}",
+                        vtype="C",
+                        lb=0.0,
+                        ub=max_boat_energy_per_timestep * num_chargers,  # Max if all chargers charge this boat
+                    )
+                else:
+                    # Boat is sailing - cannot receive energy
+                    boat_energy[b_idx][t] = None
 
         # Grid import per timestep (kW)
         g: Dict[int, object] = {}
@@ -182,23 +209,52 @@ class ReliabilityFirstOptimizer:
             return quicksum(p[c][t] for c in range(num_chargers))
 
         # -----------------------------
-        # Constraints: balance + grid limit
+        # CONSTRAINTS
         # -----------------------------
+
+        # Constraint 1: Power balance - grid + PV + BESS >= chargers
         for t in timesteps:
             total_p = total_charger_power(t)
             if has_bess:
-                # g + pv + bnet >= chargers
                 model.addCons(g[t] + pv_kw[t] + bnet[t] >= total_p, name=f"balance_{t}")
             else:
                 model.addCons(g[t] + pv_kw[t] >= total_p, name=f"balance_{t}")
 
+            # Grid import cannot exceed contracted power
             model.addCons(
                 g[t] <= float(self.port.contracted_power), name=f"grid_limit_{t}"
             )
 
-        # -----------------------------
-        # BESS energy budgets (linearized)
-        # -----------------------------
+        # Constraint 2: Total charger power equals sum of boat energy (energy conservation)
+        for t in timesteps:
+            boat_energy_sum = quicksum(
+                boat_energy[b_idx][t] for b_idx in range(num_boats)
+                if boat_energy[b_idx][t] is not None
+            )
+            model.addCons(
+                total_charger_power(t) * self.dt_h == boat_energy_sum,
+                name=f"energy_conservation_{t}"
+            )
+
+        # Constraint 3: Boat energy is bounded by available chargers and boat availability
+        for t in timesteps:
+            if boats_available_count[t] == 0:
+                # No boats available - all chargers should be idle
+                for c in range(num_chargers):
+                    model.addCons(p[c][t] == 0, name=f"no_boats_{c}_{t}")
+            else:
+                # Boat energy cannot exceed total charger capacity
+                # Each boat can receive at most the sum of all charger powers
+                for b_idx in range(num_boats):
+                    if boat_energy[b_idx][t] is not None:
+                        # A boat can receive at most total charger power
+                        # But we also need to ensure fair distribution
+                        model.addCons(
+                            boat_energy[b_idx][t] <= total_charger_power(t) * self.dt_h,
+                            name=f"boat_energy_bound_{b_idx}_{t}"
+                        )
+
+        # Constraint 4: BESS energy budgets (linearized)
         if has_bess:
             bdis: Dict[int, object] = {}
             bchg: Dict[int, object] = {}
@@ -223,9 +279,7 @@ class ReliabilityFirstOptimizer:
                 name="bess_charge_energy_limit",
             )
 
-        # -----------------------------
-        # DEADLINE ENERGY CONSTRAINTS (critical for reliability)
-        # -----------------------------
+        # Constraint 5: PER-BOAT energy deadline constraints (critical for reliability)
         slot_deadline_t: Dict[int, int] = {}
         for hour, slot in TRIP_SLOTS:
             idx = self._timestep_index_for_time(energy_forecasts, hour, 0)
@@ -238,42 +292,77 @@ class ReliabilityFirstOptimizer:
                 slot_deadline_t[slot] = idx
 
         if slot_deadline_t:
-            required_by_slot_kwh = self._required_energy_by_slot_kwh(trip_assignments)
+            # Get per-boat energy requirements
+            boat_requirements = self._required_energy_per_boat_kwh(trip_assignments)
 
-            for slot, deadline_idx in sorted(
-                slot_deadline_t.items(), key=lambda x: x[1]
-            ):
-                req_kwh = float(required_by_slot_kwh.get(slot, 0.0))
-                if req_kwh <= 1e-6:
-                    continue
+            for b_idx, boat in enumerate(self.port.boats):
+                for slot, deadline_idx in sorted(
+                    slot_deadline_t.items(), key=lambda x: x[1]
+                ):
+                    req_kwh = boat_requirements.get(boat.name, {}).get(slot, 0.0)
+                    if req_kwh <= 1e-6:
+                        continue
 
-                # Decide inclusive/exclusive horizon
-                upper = (
-                    deadline_idx + 1
-                    if INCLUDE_DEPARTURE_TIMESTEP_IN_DEADLINE
-                    else deadline_idx
-                )
-                upper = max(0, min(upper, T))
+                    # Decide inclusive/exclusive horizon
+                    upper = (
+                        deadline_idx + 1
+                        if INCLUDE_DEPARTURE_TIMESTEP_IN_DEADLINE
+                        else deadline_idx
+                    )
+                    upper = max(0, min(upper, T))
 
-                delivered_up_to_deadline = quicksum(
-                    p[c][t] * self.dt_h
-                    for c in range(num_chargers)
-                    for t in range(upper)
-                )
+                    # Energy delivered to THIS boat by the deadline
+                    delivered_to_boat = quicksum(
+                        boat_energy[b_idx][t]
+                        for t in range(upper)
+                        if boat_energy[b_idx][t] is not None
+                    )
 
-                model.addCons(
-                    delivered_up_to_deadline >= req_kwh * (1.0 + ENERGY_MARGIN_FRAC),
-                    name=f"deadline_energy_slot_{slot}",
-                )
+                    model.addCons(
+                        delivered_to_boat >= req_kwh * (1.0 + ENERGY_MARGIN_FRAC),
+                        name=f"boat_{b_idx}_deadline_energy_slot_{slot}",
+                    )
 
         # -----------------------------
-        # Objective: maximize total delivered energy + early bias
+        # OBJECTIVE: maximize total delivered energy + early bias + cost minimization
         # -----------------------------
-        obj = quicksum(
-            p[c][t] * self.dt_h * (W_TOTAL + W_EARLY * (T - t) / max(1, T))
+        # Base: maximize total energy delivered
+        energy_obj = quicksum(
+            p[c][t] * self.dt_h * W_TOTAL
             for c in range(num_chargers)
             for t in timesteps
         )
+
+        # Early charging bias (prioritize charging before trips)
+        early_obj = quicksum(
+            p[c][t] * self.dt_h * W_EARLY * (T - t) / max(1, T)
+            for c in range(num_chargers)
+            for t in timesteps
+        )
+
+        # Cost-aware: minimize grid import cost when no trips are critical
+        max_price = max(tariff_price.values()) if tariff_price.values() else 1.0
+        cost_obj = 0.0
+        for t in timesteps:
+            if max_price > 0:
+                normalized_price = tariff_price[t] / max_price
+                cost_weight = W_COST * (1.0 - normalized_price)
+            else:
+                cost_weight = W_COST
+            
+            # Only apply cost preference when boats are available and no imminent trips
+            boats_available_for_cost = sum(
+                1 for b_idx in range(num_boats)
+                if boat_available[b_idx][t] and self._has_no_imminent_trip(
+                    b_idx, t, energy_forecasts, trip_assignments
+                )
+            )
+            
+            if boats_available_for_cost > 0:
+                cost_obj += g[t] * self.dt_h * cost_weight
+
+        # Combine objectives
+        obj = energy_obj + early_obj - cost_obj
         model.setObjective(obj, "maximize")
 
         # -----------------------------
@@ -291,41 +380,55 @@ class ReliabilityFirstOptimizer:
         peak_power = 0.0
         total_energy = 0.0
 
+        # Check if we have a valid solution before extracting values
         if status in ["optimal", "bestsollimit", "timelimit"]:
-            for t in timesteps:
-                ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
-                total_p_t = 0.0
-
-                for c_idx, charger in enumerate(self.port.chargers):
-                    val = float(model.getVal(p[c_idx][t]))
-                    if val < 0:
-                        val = 0.0
-                    charger_schedules[charger.name].append((ts, val))
-                    total_p_t += val
-
-                peak_power = max(peak_power, total_p_t)
-                total_energy += total_p_t * self.dt_h
-
-            if has_bess:
+            try:
                 for t in timesteps:
                     ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
-                    net = float(model.getVal(bnet[t]))
-                    per = (
-                        net / len(self.port.bess_systems)
-                        if self.port.bess_systems
-                        else 0.0
-                    )
-                    for bess in self.port.bess_systems:
-                        bess_schedules[bess.name].append((ts, per))
-            else:
-                for bess in self.port.bess_systems:
+                    total_p_t = 0.0
+
+                    for c_idx, charger in enumerate(self.port.chargers):
+                        try:
+                            val = float(model.getVal(p[c_idx][t]))
+                            if val < 0:
+                                val = 0.0
+                            charger_schedules[charger.name].append((ts, val))
+                            total_p_t += val
+                        except Exception as e:
+                            # If we can't get value, use 0.0
+                            print(f"     ⚠️ Could not get charger {charger.name} power at {ts}: {e}")
+                            charger_schedules[charger.name].append((ts, 0.0))
+
+                    peak_power = max(peak_power, total_p_t)
+                    total_energy += total_p_t * self.dt_h
+
+                if has_bess:
                     for t in timesteps:
-                        ts = forecast_date + timedelta(
-                            seconds=t * self.timestep_seconds
-                        )
-                        bess_schedules[bess.name].append((ts, 0.0))
+                        ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+                        try:
+                            net = float(model.getVal(bnet[t]))
+                            per = (
+                                net / len(self.port.bess_systems)
+                                if self.port.bess_systems
+                                else 0.0
+                            )
+                            for bess in self.port.bess_systems:
+                                bess_schedules[bess.name].append((ts, per))
+                        except Exception as e:
+                            print(f"     ⚠️ Could not get BESS power at {ts}: {e}")
+                            for bess in self.port.bess_systems:
+                                bess_schedules[bess.name].append((ts, 0.0))
+                else:
+                    for bess in self.port.bess_systems:
+                        for t in timesteps:
+                            ts = forecast_date + timedelta(
+                                seconds=t * self.timestep_seconds
+                            )
+                            bess_schedules[bess.name].append((ts, 0.0))
+            except Exception as e:
+                print(f"     ⚠️ Error extracting solution values: {e}")
+                print(f"     Model status: {status}")
         else:
-            # If infeasible, still return empty schedules (engine can handle no schedule)
             print(f"     ⚠️ SCIP status {status} — returning empty schedules.")
 
         return ReliabilityFirstOptimizationResult(
@@ -371,52 +474,73 @@ class ReliabilityFirstOptimizer:
                 return i
         return None
 
-    def _required_energy_by_slot_kwh(
+    def _has_no_imminent_trip(
+        self,
+        boat_idx: int,
+        timestep: int,
+        energy_forecasts: List[EnergyForecast],
+        trip_assignments: Dict[str, List[Trip]],
+    ) -> bool:
+        """Check if boat has no imminent trip (within next 2 hours)."""
+        boat = self.port.boats[boat_idx]
+        trips = trip_assignments.get(boat.name, [])
+        if not trips:
+            return True
+
+        current_time = energy_forecasts[timestep].timestamp
+        for hour, slot in TRIP_SLOTS:
+            if slot < len(trips):
+                trip_time = current_time.replace(hour=hour, minute=0, second=0)
+                hours_until_trip = (trip_time - current_time).total_seconds() / 3600.0
+                if 0 < hours_until_trip < 2:
+                    return False
+        return True
+
+    def _required_energy_per_boat_kwh(
         self, trip_assignments: Dict[str, List[Trip]]
-    ) -> Dict[int, float]:
+    ) -> Dict[str, Dict[int, float]]:
         """
-        Aggregate required CHARGED energy by each slot deadline.
+        Calculate required CHARGED energy per boat per slot deadline.
 
-        For each boat:
-        - compute current stored energy (kWh) from SOC * capacity
-        - compute cumulative trip energy required up to each slot
-        - required charged energy by that slot is max(0, cum_trip_kwh - current_energy)
-
-        Fix: account for charging efficiency so the optimizer doesn't under-provision.
+        Returns:
+            Dict[boat_name, Dict[slot, required_kwh]]
         """
-        # Current energy per boat (kWh)
-        boat_now_kwh: Dict[str, float] = {
-            b.name: float(b.soc) * float(b.battery_capacity) for b in self.port.boats
-        }
-
-        # Per boat, per slot trip requirement (kWh)
-        boat_trip_req: Dict[str, Dict[int, float]] = {
-            b.name: {} for b in self.port.boats
-        }
+        boat_requirements: Dict[str, Dict[int, float]] = {}
 
         for boat in self.port.boats:
-            trips = trip_assignments.get(boat.name, [])
-            # get efficiency if present, else conservative default
+            boat_requirements[boat.name] = {}
+            
+            boat_now_kwh = float(boat.soc) * float(boat.battery_capacity)
             eff = float(getattr(boat, "charge_efficiency", DEFAULT_CHARGE_EFF))
-            eff = max(0.7, min(1.0, eff))  # clamp sanity
+            eff = max(0.7, min(1.0, eff))
+
+            trips = trip_assignments.get(boat.name, [])
+            cum_trip_energy = 0.0
 
             for hour, slot in TRIP_SLOTS:
                 if slot < len(trips) and trips[slot] is not None:
                     trip_kwh = float(trips[slot].estimate_energy_required(boat.k))
-                    # convert required "battery energy" to required "delivered energy"
                     trip_kwh_delivered = trip_kwh / eff
-                    boat_trip_req[boat.name][slot] = trip_kwh_delivered
+                    cum_trip_energy += trip_kwh_delivered
                 else:
-                    boat_trip_req[boat.name][slot] = 0.0
+                    cum_trip_energy += 0.0
 
-        # Aggregate cumulative requirement by slot
+                need = max(0.0, cum_trip_energy - boat_now_kwh)
+                boat_requirements[boat.name][slot] = need
+
+        return boat_requirements
+
+    def _required_energy_by_slot_kwh(
+        self, trip_assignments: Dict[str, List[Trip]]
+    ) -> Dict[int, float]:
+        """
+        Aggregate required CHARGED energy by each slot deadline (legacy method).
+        """
+        boat_reqs = self._required_energy_per_boat_kwh(trip_assignments)
+        
         required_by_slot: Dict[int, float] = {slot: 0.0 for _, slot in TRIP_SLOTS}
-
-        for boat in self.port.boats:
-            cum = 0.0
-            for _, slot in TRIP_SLOTS:
-                cum += boat_trip_req[boat.name].get(slot, 0.0)
-                need = max(0.0, cum - boat_now_kwh[boat.name])
-                required_by_slot[slot] += need
+        for boat_name, slot_reqs in boat_reqs.items():
+            for slot, req_kwh in slot_reqs.items():
+                required_by_slot[slot] += req_kwh
 
         return required_by_slot

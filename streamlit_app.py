@@ -8,7 +8,7 @@ UX goals:
 - Opinionated defaults
 """
 
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 import sqlite3
 
@@ -65,13 +65,11 @@ def get_metrics(db_path: str) -> pd.DataFrame:
 def load_data(
     db_path: str,
     table: str,
-    source_ids: list[int],
-    metric_ids: list[int],
+    source_ids: list[int] | None,
+    metric_ids: list[int] | None,
     start_time: str | None,
     end_time: str | None,
 ) -> pd.DataFrame:
-    if not source_ids or not metric_ids:
-        return pd.DataFrame()
 
     with connect(db_path) as conn:
         q = f"""
@@ -84,10 +82,17 @@ def load_data(
             FROM {table} d
             JOIN source s ON d.source_id = s.source_id
             JOIN metric m ON d.metric_id = m.metric_id
-            WHERE d.source_id IN ({",".join("?" * len(source_ids))})
-              AND d.metric_id IN ({",".join("?" * len(metric_ids))})
+            WHERE 1=1
         """
-        params = [*source_ids, *metric_ids]
+        params: list = []
+
+        if source_ids:
+            q += f" AND d.source_id IN ({','.join('?' * len(source_ids))})"
+            params.extend(source_ids)
+
+        if metric_ids:
+            q += f" AND d.metric_id IN ({','.join('?' * len(metric_ids))})"
+            params.extend(metric_ids)
 
         if start_time:
             q += " AND d.timestamp >= ?"
@@ -99,9 +104,7 @@ def load_data(
 
         q += " ORDER BY d.timestamp"
 
-        df = pd.read_sql_query(q, conn, params=params)
-
-    return df
+        return pd.read_sql_query(q, conn, params=params)
 
 
 # -----------------------
@@ -155,7 +158,7 @@ def main():
     st.title("⚓ Port Simulation Viewer")
 
     # -----------------------
-    # Sidebar: DB + page
+    # Sidebar
     # -----------------------
 
     db_files = get_db_files()
@@ -166,7 +169,6 @@ def main():
     selected_db = st.sidebar.selectbox("Database", db_files)
     page = st.sidebar.radio("Page", ["Explore", "Raw data"])
 
-    # Load registries
     sources = get_sources(selected_db)
     metrics = get_metrics(selected_db)
 
@@ -203,8 +205,7 @@ def main():
                 selected_metric_labels = st.multiselect(
                     "Metrics",
                     options=metric_labels,
-                    # Default power_active
-                    default=["power_active (kW)"],
+                    default=[],
                 )
                 selected_metrics = [label_to_name[l] for l in selected_metric_labels]
 
@@ -218,17 +219,25 @@ def main():
         with st.container(border=True):
             st.markdown("### Time series")
 
-            if not selected_sources or not selected_metrics:
-                st.info("Select at least one source and one metric")
+            if not selected_sources and not selected_metrics:
+                st.info("Select a source or a metric to begin")
                 return
 
-            source_ids = sources[sources["source_name"].isin(selected_sources)][
-                "source_id"
-            ].tolist()
+            source_ids = (
+                sources.loc[
+                    sources["source_name"].isin(selected_sources), "source_id"
+                ].tolist()
+                if selected_sources
+                else None
+            )
 
-            metric_ids = metrics[metrics["metric_name"].isin(selected_metrics)][
-                "metric_id"
-            ].tolist()
+            metric_ids = (
+                metrics.loc[
+                    metrics["metric_name"].isin(selected_metrics), "metric_id"
+                ].tolist()
+                if selected_metrics
+                else None
+            )
 
             start_time = (
                 datetime.combine(start_date, datetime.min.time()).isoformat()

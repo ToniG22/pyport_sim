@@ -33,6 +33,7 @@ class Settings:
         db_path: Path to SQLite database file
         use_optimizer: Whether to use optimization for scheduling
         optimizer_type: Type of optimizer to use (cost or reliability)
+        power_limit_mode: Whether to enforce contracted power limit without optimization (baseline mode)
     """
 
     timestep: int = 900  # Default: 15 minutes
@@ -42,6 +43,7 @@ class Settings:
     optimizer_type: OptimizerType = (
         OptimizerType.RELIABILITY_FIRST
     )  # Default: reliability-focused
+    power_limit_mode: bool = False  # Default: no power limiting (unlimited charging)
 
     def __post_init__(self):
         """Validate settings."""

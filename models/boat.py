@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+HULL_FACTOR = 0.75
+
+
 class BoatState(Enum):
     """Possible states for a boat."""
 
@@ -69,7 +72,7 @@ class Boat:
         Returns:
             K-factor for power consumption calculations
         """
-        return self.motor_power / (self.range_speed**3)
+        return self.motor_power / (self.range_speed**3) * HULL_FACTOR
 
     @property
     def state(self) -> BoatState:
@@ -94,4 +97,3 @@ class Boat:
             f"battery={self.battery_capacity}kWh, soc={self.soc:.1%}, "
             f"state={self.state.value})"
         )
-
