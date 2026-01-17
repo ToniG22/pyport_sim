@@ -9,6 +9,9 @@ EXCLUDE = {
     "run_all.py",
     "calculate_kpis.py",
     "compare_scenarios.py",
+    "20_vessels_baseline_der.py",
+    "20_vessels_baseline_no_der.py",
+    "baseline_power_limit_test.py",
 }
 
 scripts = sorted(

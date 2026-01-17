@@ -43,9 +43,11 @@ INCLUDE_DEPARTURE_TIMESTEP_IN_DEADLINE = False
 DEFAULT_CHARGE_EFF = 0.95
 
 # Objective weights
-W_EARLY = 0.05  # Early charging bias to satisfy deadlines comfortably
+W_EARLY = 0.2  # Increased early charging bias to satisfy deadlines comfortably
 W_TOTAL = 1.0
 W_COST = 0.1  # Cost minimization when no trips scheduled
+W_DEADLINE_PENALTY = 500.0  # Large penalty for missing boat energy deadlines (soft constraint)
+W_URGENT = 2.0  # Weight for urgent charging (boats with trips coming soon)
 
 
 # -----------------------------------------------------------------------------
@@ -279,7 +281,8 @@ class ReliabilityFirstOptimizer:
                 name="bess_charge_energy_limit",
             )
 
-        # Constraint 5: PER-BOAT energy deadline constraints (critical for reliability)
+        # Constraint 5: PER-BOAT energy deadline constraints (SOFT constraints with penalties)
+        # Use slack variables to allow deadline violations, penalized in objective
         slot_deadline_t: Dict[int, int] = {}
         for hour, slot in TRIP_SLOTS:
             idx = self._timestep_index_for_time(energy_forecasts, hour, 0)
@@ -291,11 +294,16 @@ class ReliabilityFirstOptimizer:
             else:
                 slot_deadline_t[slot] = idx
 
+        # Slack variables for deadline violations (allow some boats to miss deadlines)
+        deadline_slack: Dict[int, Dict[int, object]] = {}  # boat_idx -> slot -> slack (kWh shortfall)
+        
         if slot_deadline_t:
             # Get per-boat energy requirements
             boat_requirements = self._required_energy_per_boat_kwh(trip_assignments)
 
             for b_idx, boat in enumerate(self.port.boats):
+                deadline_slack[b_idx] = {}
+                
                 for slot, deadline_idx in sorted(
                     slot_deadline_t.items(), key=lambda x: x[1]
                 ):
@@ -318,13 +326,24 @@ class ReliabilityFirstOptimizer:
                         if boat_energy[b_idx][t] is not None
                     )
 
+                    # Slack variable: how much energy is SHORT (kWh) - allows deadline violations
+                    slack = model.addVar(
+                        name=f"deadline_slack_{b_idx}_slot_{slot}",
+                        vtype="C",
+                        lb=0.0,
+                        ub=req_kwh * 2.0,  # Allow up to 2x requirement as shortfall
+                    )
+                    deadline_slack[b_idx][slot] = slack
+
+                    # Soft constraint: delivered + slack >= required
+                    # If slack > 0, the boat didn't meet the deadline (penalized in objective)
                     model.addCons(
-                        delivered_to_boat >= req_kwh * (1.0 + ENERGY_MARGIN_FRAC),
-                        name=f"boat_{b_idx}_deadline_energy_slot_{slot}",
+                        delivered_to_boat + slack >= req_kwh * (1.0 + ENERGY_MARGIN_FRAC),
+                        name=f"boat_{b_idx}_deadline_energy_slot_{slot}_soft",
                     )
 
         # -----------------------------
-        # OBJECTIVE: maximize total delivered energy + early bias + cost minimization
+        # OBJECTIVE: maximize total delivered energy + early bias + urgent charging + cost minimization
         # -----------------------------
         # Base: maximize total energy delivered
         energy_obj = quicksum(
@@ -339,6 +358,33 @@ class ReliabilityFirstOptimizer:
             for c in range(num_chargers)
             for t in timesteps
         )
+
+        # Urgent charging: prioritize charging for boats with trips coming soon
+        # Weight energy delivered to boats based on how soon their next trip is
+        urgent_obj = 0.0
+        for t in timesteps:
+            timestamp = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+            for b_idx in range(num_boats):
+                if boat_energy[b_idx][t] is None:
+                    continue
+                
+                # Calculate hours until next trip
+                boat = self.port.boats[b_idx]
+                trips = trip_assignments.get(boat.name, [])
+                hours_until_trip = float('inf')
+                
+                for hour, slot in TRIP_SLOTS:
+                    if slot < len(trips) and trips[slot] is not None:
+                        trip_time = timestamp.replace(hour=hour, minute=0, second=0)
+                        if trip_time > timestamp:
+                            hrs = (trip_time - timestamp).total_seconds() / 3600.0
+                            if hrs < hours_until_trip:
+                                hours_until_trip = hrs
+                
+                # Higher weight for boats with trips coming soon (within 5 hours)
+                if hours_until_trip < 5.0:
+                    urgency_weight = W_URGENT * (5.0 - hours_until_trip) / 5.0
+                    urgent_obj += boat_energy[b_idx][t] * urgency_weight
 
         # Cost-aware: minimize grid import cost when no trips are critical
         max_price = max(tariff_price.values()) if tariff_price.values() else 1.0
@@ -361,8 +407,19 @@ class ReliabilityFirstOptimizer:
             if boats_available_for_cost > 0:
                 cost_obj += g[t] * self.dt_h * cost_weight
 
-        # Combine objectives
-        obj = energy_obj + early_obj - cost_obj
+        # Penalty for deadline violations (slack variables)
+        deadline_penalty = 0.0
+        if slot_deadline_t:
+            for b_idx in range(num_boats):
+                for slot in deadline_slack.get(b_idx, {}):
+                    slack = deadline_slack[b_idx][slot]
+                    # Large penalty for missing deadlines - but allows it for feasibility
+                    deadline_penalty += slack * W_DEADLINE_PENALTY
+
+        # Combine objectives: maximize energy + early charging + urgent charging, 
+        # minimize cost and deadline violations
+        # Use maximization with negative penalties
+        obj = energy_obj + early_obj + urgent_obj - cost_obj - deadline_penalty
         model.setObjective(obj, "maximize")
 
         # -----------------------------
