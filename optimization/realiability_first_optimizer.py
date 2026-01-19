@@ -46,7 +46,9 @@ DEFAULT_CHARGE_EFF = 0.95
 W_EARLY = 0.2  # Increased early charging bias to satisfy deadlines comfortably
 W_TOTAL = 1.0
 W_COST = 0.1  # Cost minimization when no trips scheduled
-W_DEADLINE_PENALTY = 500.0  # Large penalty for missing boat energy deadlines (soft constraint)
+W_DEADLINE_PENALTY = (
+    500.0  # Large penalty for missing boat energy deadlines (soft constraint)
+)
 W_URGENT = 2.0  # Weight for urgent charging (boats with trips coming soon)
 
 
@@ -93,7 +95,7 @@ class ReliabilityFirstOptimizer:
 
         num_chargers = len(self.port.chargers)
         num_boats = len(self.port.boats)
-        
+
         if num_chargers == 0:
             return ReliabilityFirstOptimizationResult(
                 status="no_chargers",
@@ -118,13 +120,15 @@ class ReliabilityFirstOptimizer:
         # Boat availability per timestep
         # -----------------------------
         boat_available: Dict[int, Dict[int, bool]] = {}
-        boats_available_count: Dict[int, int] = {}  # timestep -> count of available boats
+        boats_available_count: Dict[int, int] = (
+            {}
+        )  # timestep -> count of available boats
         for b_idx, boat in enumerate(self.port.boats):
             boat_available[b_idx] = {}
             for t in timesteps:
                 state = energy_forecasts[t].boat_states.get(boat.name, BoatState.IDLE)
-                boat_available[b_idx][t] = (state != BoatState.SAILING)
-        
+                boat_available[b_idx][t] = state != BoatState.SAILING
+
         for t in timesteps:
             boats_available_count[t] = sum(
                 1 for b_idx in range(num_boats) if boat_available[b_idx][t]
@@ -151,11 +155,13 @@ class ReliabilityFirstOptimizer:
 
         # Energy delivered per boat per timestep (kWh) - continuous auxiliary variable
         # This tracks how much energy each boat receives without explicit charger assignment
-        boat_energy: Dict[int, Dict[int, object]] = {}  # boat_idx -> timestep -> energy_kWh
+        boat_energy: Dict[int, Dict[int, object]] = (
+            {}
+        )  # boat_idx -> timestep -> energy_kWh
         max_boat_energy_per_timestep = max(
             float(c.max_power) * self.dt_h for c in self.port.chargers
         )
-        
+
         for b_idx in range(num_boats):
             boat_energy[b_idx] = {}
             for t in timesteps:
@@ -165,7 +171,8 @@ class ReliabilityFirstOptimizer:
                         name=f"boat_energy_{b_idx}_{t}",
                         vtype="C",
                         lb=0.0,
-                        ub=max_boat_energy_per_timestep * num_chargers,  # Max if all chargers charge this boat
+                        ub=max_boat_energy_per_timestep
+                        * num_chargers,  # Max if all chargers charge this boat
                     )
                 else:
                     # Boat is sailing - cannot receive energy
@@ -230,12 +237,13 @@ class ReliabilityFirstOptimizer:
         # Constraint 2: Total charger power equals sum of boat energy (energy conservation)
         for t in timesteps:
             boat_energy_sum = quicksum(
-                boat_energy[b_idx][t] for b_idx in range(num_boats)
+                boat_energy[b_idx][t]
+                for b_idx in range(num_boats)
                 if boat_energy[b_idx][t] is not None
             )
             model.addCons(
                 total_charger_power(t) * self.dt_h == boat_energy_sum,
-                name=f"energy_conservation_{t}"
+                name=f"energy_conservation_{t}",
             )
 
         # Constraint 3: Boat energy is bounded by available chargers and boat availability
@@ -245,15 +253,12 @@ class ReliabilityFirstOptimizer:
                 for c in range(num_chargers):
                     model.addCons(p[c][t] == 0, name=f"no_boats_{c}_{t}")
             else:
-                # Boat energy cannot exceed total charger capacity
-                # Each boat can receive at most the sum of all charger powers
+                # Each boat can receive at most total charger power (kWh form)
                 for b_idx in range(num_boats):
                     if boat_energy[b_idx][t] is not None:
-                        # A boat can receive at most total charger power
-                        # But we also need to ensure fair distribution
                         model.addCons(
                             boat_energy[b_idx][t] <= total_charger_power(t) * self.dt_h,
-                            name=f"boat_energy_bound_{b_idx}_{t}"
+                            name=f"boat_energy_bound_{b_idx}_{t}",
                         )
 
         # Constraint 4: BESS energy budgets (linearized)
@@ -282,7 +287,6 @@ class ReliabilityFirstOptimizer:
             )
 
         # Constraint 5: PER-BOAT energy deadline constraints (SOFT constraints with penalties)
-        # Use slack variables to allow deadline violations, penalized in objective
         slot_deadline_t: Dict[int, int] = {}
         for hour, slot in TRIP_SLOTS:
             idx = self._timestep_index_for_time(energy_forecasts, hour, 0)
@@ -294,16 +298,16 @@ class ReliabilityFirstOptimizer:
             else:
                 slot_deadline_t[slot] = idx
 
-        # Slack variables for deadline violations (allow some boats to miss deadlines)
-        deadline_slack: Dict[int, Dict[int, object]] = {}  # boat_idx -> slot -> slack (kWh shortfall)
-        
+        deadline_slack: Dict[int, Dict[int, object]] = (
+            {}
+        )  # boat_idx -> slot -> slack (kWh shortfall)
+
         if slot_deadline_t:
-            # Get per-boat energy requirements
             boat_requirements = self._required_energy_per_boat_kwh(trip_assignments)
 
             for b_idx, boat in enumerate(self.port.boats):
                 deadline_slack[b_idx] = {}
-                
+
                 for slot, deadline_idx in sorted(
                     slot_deadline_t.items(), key=lambda x: x[1]
                 ):
@@ -311,7 +315,6 @@ class ReliabilityFirstOptimizer:
                     if req_kwh <= 1e-6:
                         continue
 
-                    # Decide inclusive/exclusive horizon
                     upper = (
                         deadline_idx + 1
                         if INCLUDE_DEPARTURE_TIMESTEP_IN_DEADLINE
@@ -319,60 +322,53 @@ class ReliabilityFirstOptimizer:
                     )
                     upper = max(0, min(upper, T))
 
-                    # Energy delivered to THIS boat by the deadline
                     delivered_to_boat = quicksum(
                         boat_energy[b_idx][t]
                         for t in range(upper)
                         if boat_energy[b_idx][t] is not None
                     )
 
-                    # Slack variable: how much energy is SHORT (kWh) - allows deadline violations
                     slack = model.addVar(
                         name=f"deadline_slack_{b_idx}_slot_{slot}",
                         vtype="C",
                         lb=0.0,
-                        ub=req_kwh * 2.0,  # Allow up to 2x requirement as shortfall
+                        ub=req_kwh * 2.0,
                     )
                     deadline_slack[b_idx][slot] = slack
 
-                    # Soft constraint: delivered + slack >= required
-                    # If slack > 0, the boat didn't meet the deadline (penalized in objective)
                     model.addCons(
-                        delivered_to_boat + slack >= req_kwh * (1.0 + ENERGY_MARGIN_FRAC),
+                        delivered_to_boat + slack
+                        >= req_kwh * (1.0 + ENERGY_MARGIN_FRAC),
                         name=f"boat_{b_idx}_deadline_energy_slot_{slot}_soft",
                     )
 
         # -----------------------------
-        # OBJECTIVE: maximize total delivered energy + early bias + urgent charging + cost minimization
+        # OBJECTIVE
         # -----------------------------
-        # Base: maximize total energy delivered
+
         energy_obj = quicksum(
             p[c][t] * self.dt_h * W_TOTAL
             for c in range(num_chargers)
             for t in timesteps
         )
 
-        # Early charging bias (prioritize charging before trips)
         early_obj = quicksum(
             p[c][t] * self.dt_h * W_EARLY * (T - t) / max(1, T)
             for c in range(num_chargers)
             for t in timesteps
         )
 
-        # Urgent charging: prioritize charging for boats with trips coming soon
-        # Weight energy delivered to boats based on how soon their next trip is
         urgent_obj = 0.0
         for t in timesteps:
             timestamp = forecast_date + timedelta(seconds=t * self.timestep_seconds)
             for b_idx in range(num_boats):
                 if boat_energy[b_idx][t] is None:
                     continue
-                
-                # Calculate hours until next trip
+
                 boat = self.port.boats[b_idx]
                 trips = trip_assignments.get(boat.name, [])
-                hours_until_trip = float('inf')
-                
+                hours_until_trip = float("inf")
+
                 for hour, slot in TRIP_SLOTS:
                     if slot < len(trips) and trips[slot] is not None:
                         trip_time = timestamp.replace(hour=hour, minute=0, second=0)
@@ -380,13 +376,11 @@ class ReliabilityFirstOptimizer:
                             hrs = (trip_time - timestamp).total_seconds() / 3600.0
                             if hrs < hours_until_trip:
                                 hours_until_trip = hrs
-                
-                # Higher weight for boats with trips coming soon (within 5 hours)
+
                 if hours_until_trip < 5.0:
                     urgency_weight = W_URGENT * (5.0 - hours_until_trip) / 5.0
                     urgent_obj += boat_energy[b_idx][t] * urgency_weight
 
-        # Cost-aware: minimize grid import cost when no trips are critical
         max_price = max(tariff_price.values()) if tariff_price.values() else 1.0
         cost_obj = 0.0
         for t in timesteps:
@@ -395,30 +389,26 @@ class ReliabilityFirstOptimizer:
                 cost_weight = W_COST * (1.0 - normalized_price)
             else:
                 cost_weight = W_COST
-            
-            # Only apply cost preference when boats are available and no imminent trips
+
             boats_available_for_cost = sum(
-                1 for b_idx in range(num_boats)
-                if boat_available[b_idx][t] and self._has_no_imminent_trip(
+                1
+                for b_idx in range(num_boats)
+                if boat_available[b_idx][t]
+                and self._has_no_imminent_trip(
                     b_idx, t, energy_forecasts, trip_assignments
                 )
             )
-            
+
             if boats_available_for_cost > 0:
                 cost_obj += g[t] * self.dt_h * cost_weight
 
-        # Penalty for deadline violations (slack variables)
         deadline_penalty = 0.0
         if slot_deadline_t:
             for b_idx in range(num_boats):
                 for slot in deadline_slack.get(b_idx, {}):
                     slack = deadline_slack[b_idx][slot]
-                    # Large penalty for missing deadlines - but allows it for feasibility
                     deadline_penalty += slack * W_DEADLINE_PENALTY
 
-        # Combine objectives: maximize energy + early charging + urgent charging, 
-        # minimize cost and deadline violations
-        # Use maximization with negative penalties
         obj = energy_obj + early_obj + urgent_obj - cost_obj - deadline_penalty
         model.setObjective(obj, "maximize")
 
@@ -437,7 +427,6 @@ class ReliabilityFirstOptimizer:
         peak_power = 0.0
         total_energy = 0.0
 
-        # Check if we have a valid solution before extracting values
         if status in ["optimal", "bestsollimit", "timelimit"]:
             try:
                 for t in timesteps:
@@ -452,8 +441,9 @@ class ReliabilityFirstOptimizer:
                             charger_schedules[charger.name].append((ts, val))
                             total_p_t += val
                         except Exception as e:
-                            # If we can't get value, use 0.0
-                            print(f"     ⚠️ Could not get charger {charger.name} power at {ts}: {e}")
+                            print(
+                                f"     ⚠️ Could not get charger {charger.name} power at {ts}: {e}"
+                            )
                             charger_schedules[charger.name].append((ts, 0.0))
 
                     peak_power = max(peak_power, total_p_t)
@@ -461,7 +451,9 @@ class ReliabilityFirstOptimizer:
 
                 if has_bess:
                     for t in timesteps:
-                        ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+                        ts = forecast_date + timedelta(
+                            seconds=t * self.timestep_seconds
+                        )
                         try:
                             net = float(model.getVal(bnet[t]))
                             per = (
@@ -566,7 +558,7 @@ class ReliabilityFirstOptimizer:
 
         for boat in self.port.boats:
             boat_requirements[boat.name] = {}
-            
+
             boat_now_kwh = float(boat.soc) * float(boat.battery_capacity)
             eff = float(getattr(boat, "charge_efficiency", DEFAULT_CHARGE_EFF))
             eff = max(0.7, min(1.0, eff))
@@ -579,8 +571,6 @@ class ReliabilityFirstOptimizer:
                     trip_kwh = float(trips[slot].estimate_energy_required(boat.k))
                     trip_kwh_delivered = trip_kwh / eff
                     cum_trip_energy += trip_kwh_delivered
-                else:
-                    cum_trip_energy += 0.0
 
                 need = max(0.0, cum_trip_energy - boat_now_kwh)
                 boat_requirements[boat.name][slot] = need
@@ -590,13 +580,10 @@ class ReliabilityFirstOptimizer:
     def _required_energy_by_slot_kwh(
         self, trip_assignments: Dict[str, List[Trip]]
     ) -> Dict[int, float]:
-        """
-        Aggregate required CHARGED energy by each slot deadline (legacy method).
-        """
         boat_reqs = self._required_energy_per_boat_kwh(trip_assignments)
-        
+
         required_by_slot: Dict[int, float] = {slot: 0.0 for _, slot in TRIP_SLOTS}
-        for boat_name, slot_reqs in boat_reqs.items():
+        for _, slot_reqs in boat_reqs.items():
             for slot, req_kwh in slot_reqs.items():
                 required_by_slot[slot] += req_kwh
 

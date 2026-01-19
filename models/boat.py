@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
-HULL_FACTOR = 0.75
+HULL_FACTOR = 1
 
 
 class BoatState(Enum):
