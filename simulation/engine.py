@@ -10,7 +10,7 @@ from config import Settings, SimulationMode, OptimizerType
 from simulation.trip_manager import TripManager
 from weather import OpenMeteoClient
 from forecasting import PortForecaster
-from optimization import PortOptimizer, ReliabilityOptimizer, ReliabilityFirstOptimizer
+from optimization import PortOptimizer, ReliabilityOptimizer, ReliabilityFirstOptimizer, BaseOptimizer
 
 
 class SimulationEngine:
@@ -102,12 +102,16 @@ class SimulationEngine:
                     port, db_manager, settings.timestep
                 )
                 print(f"\n🔧 Optimizer enabled (Reliability-focused)")
-            if self.optimizer_type == OptimizerType.RELIABILITY_FIRST:
+            elif self.optimizer_type == OptimizerType.RELIABILITY_FIRST:
                 self.optimizer = ReliabilityFirstOptimizer(
                     port, db_manager, settings.timestep
                 )
                 print(f"\n🔧 Optimizer enabled (Reliability-first)")
-
+            elif self.optimizer_type == OptimizerType.BASE:
+                self.optimizer = BaseOptimizer(
+                    port, db_manager, settings.timestep
+                )
+                print("\n🔧 Optimizer enabled (Base - contracted power constraint only)")
             else:
                 self.optimizer = PortOptimizer(port, db_manager, settings.timestep)
                 print(f"\n🔧 Optimizer enabled (SCIP Cost-based)")

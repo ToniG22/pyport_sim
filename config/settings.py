@@ -20,6 +20,7 @@ class OptimizerType(Enum):
     RELIABILITY_FIRST = (
         "reliability_first"  # Reliability-first optimizer (ReliabilityFirstOptimizer)
     )
+    BASE = "base"  # Base optimizer with single constraint: contracted_power limit
 
 
 @dataclass
