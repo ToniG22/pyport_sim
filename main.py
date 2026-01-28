@@ -20,7 +20,7 @@ def main():
     #  Change port name, contracted power, and location as needed
     port = Port(
         name="Funchal",
-        contracted_power=40,  #  Adjust contracted power limit (kW)
+        contracted_power=80,  #  Adjust contracted power limit (kW)
         lat=32.64542,  #  Set port latitude
         lon=-16.90841,  #  Set port longitude
         tariff_path="assets/tariff/default_tariff.json",
@@ -30,42 +30,27 @@ def main():
     #  Add/remove boats, modify boat parameters (motor_power, weight, length,
     #       battery_capacity, range_speed, soc) as needed
     boat1 = Boat(
-        name="SeaBreeze",
-        motor_power=120,  #  Adjust motor power (kW)
-        weight=2500,  #  Adjust weight (kg)
-        length=8.5,  #  Adjust length (m)
-        battery_capacity=150,  #  Adjust battery capacity (kWh)
-        range_speed=15.0,  #  Adjust range speed (knots)
-        soc=0.30,  #  Adjust initial state of charge (0.0-1.0)
-    )
-
-    boat2 = Boat(
-        name="SeaBreeze_2",
+        name="SeaBreeze_1",
         motor_power=100,  #  Adjust motor power (kW)
         weight=2500,  #  Adjust weight (kg)
         length=8.5,  #  Adjust length (m)
         battery_capacity=100,  #  Adjust battery capacity (kWh)
         range_speed=16.0,  #  Adjust range speed (knots)
-        soc=0.50,  #  Adjust initial state of charge (0.0-1.0)
+        soc=0.30,  #  Adjust initial state of charge (0.0-1.0)
     )
 
-    # Charger configuration
-    #  Add/remove chargers, modify max_power and efficiency as needed
     charger1 = Charger(
         name="FastCharger_A", max_power=22, efficiency=0.95
-    )  #  Adjust max_power (kW) and efficiency
-    charger2 = Charger(
-        name="FastCharger_B", max_power=22, efficiency=0.95
     )  #  Adjust max_power (kW) and efficiency
 
     # PV system configuration
     #  Modify PV capacity, tilt, azimuth, efficiency, or remove PV system entirely
     pv_system = PV(
         name="Solar_Array_1",
-        capacity=30.0,  #  Adjust PV capacity (kW DC)
+        capacity=10.0,  #  Adjust PV capacity (kW DC)
         tilt=30.0,  #  Adjust panel tilt angle (degrees)
         azimuth=180.0,  #  Adjust panel azimuth (degrees, 180 = South-facing)
-        efficiency=0.85,  #  Adjust system efficiency (0.0-1.0)
+        efficiency=0.95,  #  Adjust system efficiency (0.0-1.0)
         latitude=port.lat,
         longitude=port.lon,
     )
@@ -86,31 +71,26 @@ def main():
 
     # Add components to port
     port.add_boat(boat1)
-    port.add_boat(boat2)
     port.add_charger(charger1)
-    port.add_charger(charger2)
-    port.add_pv(pv_system)
-    port.add_bess(bess)
+    # No PV system or BESS
+    # port.add_pv(pv_system)
+    # port.add_bess(bess)
 
     print(f"\nPort: {port}")
-    print(f"Boats: {boat1.name}, {boat2.name}")
-    print(f"Chargers: {charger1.name}, {charger2.name}")
-    print(f"PV: {pv_system}")
-    print(f"BESS: {bess}")
+    print(f"Boats: {boat1.name}")
+    print(f"Chargers: {charger1.name}")
+    # print(f"PV: {pv_system}")
+    # print(f"BESS: {bess}")
 
     # Simulation settings
     #  Modify simulation parameters (timestep, mode, db_path, use_optimizer, start_date, days)
     settings = Settings(
         timestep=900,  #  Adjust timestep duration (seconds, 900 = 15 minutes)
         mode=SimulationMode.BATCH,  #  Change to SimulationMode.REALTIME for real-time simulation
-        db_path="port_simulation_opt.db",  #  Change database file path if needed
-        use_optimizer=True,  #  Set to False to disable optimization (SCIP)
+        db_path="5_vessels_no_opt_no_der.db",  #  Change database file path if needed
+        use_optimizer=False,  #  Set to False to disable optimization (SCIP)
+        power_limit_mode=True,
     )
-
-    print(f"\n⚙️  Mode: Optimized scheduling (SCIP)")
-    print(f"   - Forecasting: Enabled")
-    print(f"   - Optimization: Enabled")
-    print(f"   - Objective: Minimize trip delays + grid usage")
 
     # Initialize database
     db_manager = DatabaseManager(settings.db_path)
@@ -131,7 +111,6 @@ def main():
 
     print("\n" + "=" * 60)
     print(f"✓ Results saved to: {settings.db_path}")
-    print(f"✓ View data using: streamlit run streamlit_app.py")
     print("=" * 60)
 
 
