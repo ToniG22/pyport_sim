@@ -278,23 +278,20 @@ class SimulationEngine:
 
             # Run optimization if enabled
             if self.use_optimizer and self.optimizer:
-                self._run_optimization(trip_assignments)
+                self._run_optimization()
 
             self.last_energy_forecast_date = current_date_str
             print()
 
-    def _run_optimization(self, trip_assignments: Dict[str, List]):
+    def _run_optimization(self):
         """
         Run optimization to create optimal schedules for chargers and BESS.
-
-        Args:
-            trip_assignments: Trip assignments per boat
         """
         print(f"  🎯 Running optimization...")
 
         # Run optimization
         result = self.optimizer.optimize_daily_schedule(
-            self.current_datetime, self.latest_energy_forecasts, trip_assignments
+            self.current_datetime, self.latest_energy_forecasts
         )
 
         # For reliability optimizer, track boats with issues
@@ -354,7 +351,7 @@ class SimulationEngine:
         if remaining_forecasts:
             # Run optimization with updated boat SOCs
             result = self.optimizer.optimize_daily_schedule(
-                self.current_datetime, remaining_forecasts, trip_assignments
+                self.current_datetime, remaining_forecasts
             )
 
             # For reliability optimizer, track boats with issues
@@ -732,9 +729,7 @@ class SimulationEngine:
             if slot_idx < 0:
                 return datetime.max
             start_hour = self.trip_schedule[slot_idx][0]
-            return self.current_datetime.replace(
-                hour=start_hour, minute=0, second=0
-            )
+            return self.current_datetime.replace(hour=start_hour, minute=0, second=0)
 
         # ------------------------------------------------------------------
         # Sort boats by urgency (earliest trip, then lowest SOC)
