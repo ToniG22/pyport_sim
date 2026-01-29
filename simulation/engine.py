@@ -62,11 +62,8 @@ class SimulationEngine:
         # Track boat-charger assignments
         self.boat_charger_map = {}  # {boat_name: charger_name}
 
-        # Trip schedule times: (start_hour, slot_number)
-        self.trip_schedule = [
-            (9, 0),  # 9:00 AM, slot 0
-            (14, 1),  # 2:00 PM, slot 1
-        ]
+        # Trip schedule from settings: (start_hour, slot_number)
+        self.trip_schedule = self.settings.trip_schedule
 
         # Initialize trip manager
         print(f"\nLoading trips from {trips_directory}...")
@@ -88,7 +85,9 @@ class SimulationEngine:
         self.last_energy_forecast_date: Optional[str] = None
 
         # Initialize forecaster
-        self.forecaster = PortForecaster(port, db_manager, settings.timestep)
+        self.forecaster = PortForecaster(
+            port, db_manager, settings.timestep, settings.trip_schedule
+        )
 
         # Initialize optimizer (if enabled)
         self.optimizer = None
@@ -298,10 +297,6 @@ class SimulationEngine:
             self.current_datetime, self.latest_energy_forecasts, trip_assignments
         )
 
-        # Handle energy shortfalls gracefully (only for cost optimizer)
-        if hasattr(result, "energy_shortfalls") and result.energy_shortfalls:
-            self._handle_energy_shortfalls(result, trip_assignments)
-
         # For reliability optimizer, track boats with issues
         if hasattr(result, "boats_cancelled"):
             self.boats_with_shortfalls = set(
@@ -361,10 +356,6 @@ class SimulationEngine:
             result = self.optimizer.optimize_daily_schedule(
                 self.current_datetime, remaining_forecasts, trip_assignments
             )
-
-            # Handle energy shortfalls gracefully (only for cost optimizer)
-            if hasattr(result, "energy_shortfalls") and result.energy_shortfalls:
-                self._handle_energy_shortfalls(result, trip_assignments)
 
             # For reliability optimizer, track boats with issues
             if hasattr(result, "boats_cancelled"):
@@ -737,13 +728,13 @@ class SimulationEngine:
             )
             if not trips:
                 return datetime.max
-
-            if len(trips) >= 1:
-                return self.current_datetime.replace(hour=9, minute=0, second=0)
-            if len(trips) >= 2:
-                return self.current_datetime.replace(hour=14, minute=0, second=0)
-
-            return datetime.max
+            slot_idx = min(len(trips) - 1, len(self.trip_schedule) - 1)
+            if slot_idx < 0:
+                return datetime.max
+            start_hour = self.trip_schedule[slot_idx][0]
+            return self.current_datetime.replace(
+                hour=start_hour, minute=0, second=0
+            )
 
         # ------------------------------------------------------------------
         # Sort boats by urgency (earliest trip, then lowest SOC)

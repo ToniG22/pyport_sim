@@ -26,11 +26,17 @@ class PortForecaster:
     """Forecast PV production and boat availability for the port."""
 
     def __init__(
-        self, port: Port, db_manager: DatabaseManager, timestep_seconds: int = 900
+        self,
+        port: Port,
+        db_manager: DatabaseManager,
+        timestep_seconds: int = 900,
+        trip_schedule: tuple = ((9, 0), (14, 1)),
     ):
         self.port = port
         self.db_manager = db_manager
         self.timestep_seconds = timestep_seconds
+        # (hour_utc, slot_index) per day
+        self.trip_schedule = trip_schedule
 
     def generate_daily_forecast(
         self, forecast_date: datetime, trip_assignments: Dict[str, List[Trip]]
@@ -117,27 +123,33 @@ class PortForecaster:
                 out[boat.name] = next_trip.estimate_energy_required(boat.k)
         return out
 
+    def _departure_times(self, timestamp: datetime) -> List[datetime]:
+        """Departure times for the day of timestamp from trip_schedule."""
+        return [
+            timestamp.replace(hour=hour, minute=0, second=0, microsecond=0)
+            for hour, _ in self.trip_schedule
+        ]
+
     def _next_departure_trip(
         self, timestamp: datetime, trips: List[Trip]
     ) -> Optional[Trip]:
         """Next trip (by departure time) after timestamp; None if no more trips."""
         if not trips:
             return None
-        t_trip0 = timestamp.replace(hour=9, minute=0, second=0, microsecond=0)
-        t_trip1 = timestamp.replace(hour=14, minute=0, second=0, microsecond=0)
+        start_times = self._departure_times(timestamp)
 
-        if timestamp < t_trip0 and len(trips) >= 1:
+        if len(trips) >= 1 and timestamp < start_times[0]:
             return trips[0]
         if len(trips) >= 2:
             dur0 = trips[0].duration
-            t_trip0_end = t_trip0 + timedelta(seconds=dur0)
-            if t_trip0_end <= timestamp < t_trip1:
+            t_trip0_end = start_times[0] + timedelta(seconds=dur0)
+            if t_trip0_end <= timestamp < start_times[1]:
                 return trips[1]
-            if timestamp >= t_trip1:
+            if timestamp >= start_times[1]:
                 return None  # after last departure
         else:
             dur0 = trips[0].duration
-            t_trip0_end = t_trip0 + timedelta(seconds=dur0)
+            t_trip0_end = start_times[0] + timedelta(seconds=dur0)
             if timestamp >= t_trip0_end:
                 return None
         return None
@@ -158,17 +170,12 @@ class PortForecaster:
         """True if boat is sailing at timestamp (within a trip)."""
         if not trips:
             return False
-        start_times = [
-            timestamp.replace(hour=9, minute=0, second=0, microsecond=0),
-            timestamp.replace(hour=14, minute=0, second=0, microsecond=0),
-        ]
-        if len(trips) >= 1:
-            t0_end = start_times[0] + timedelta(seconds=trips[0].duration)
-            if start_times[0] <= timestamp < t0_end:
-                return True
-        if len(trips) >= 2:
-            t1_end = start_times[1] + timedelta(seconds=trips[1].duration)
-            if start_times[1] <= timestamp < t1_end:
+        start_times = self._departure_times(timestamp)
+        for i, trip in enumerate(trips):
+            if i >= len(start_times):
+                break
+            t_end = start_times[i] + timedelta(seconds=trip.duration)
+            if start_times[i] <= timestamp < t_end:
                 return True
         return False
 
@@ -178,24 +185,21 @@ class PortForecaster:
         """True if timestamp is inside a charging availability window."""
         if not trips:
             return False
-        t_day = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-        t_trip0 = timestamp.replace(hour=9, minute=0, second=0, microsecond=0)
-        t_trip1 = timestamp.replace(hour=14, minute=0, second=0, microsecond=0)
+        start_times = self._departure_times(timestamp)
 
-        if t_day <= timestamp < t_trip0:
+        if timestamp < start_times[0]:
             return True
-        if len(trips) >= 2:
-            t_trip0_end = t_trip0 + timedelta(seconds=trips[0].duration)
-            if t_trip0_end <= timestamp < t_trip1:
-                return True
-        if len(trips) >= 2:
-            t_trip1_end = t_trip1 + timedelta(seconds=trips[1].duration)
-            if timestamp >= t_trip1_end:
-                return True
-        else:
-            t_trip0_end = t_trip0 + timedelta(seconds=trips[0].duration)
-            if timestamp >= t_trip0_end:
-                return True
+        for i, trip in enumerate(trips):
+            if i >= len(start_times):
+                break
+            t_dep = start_times[i]
+            t_dep_end = t_dep + timedelta(seconds=trip.duration)
+            if i + 1 < len(start_times):
+                if t_dep_end <= timestamp < start_times[i + 1]:
+                    return True
+            else:
+                if timestamp >= t_dep_end:
+                    return True
         return False
 
     def _get_weather_forecasts(
