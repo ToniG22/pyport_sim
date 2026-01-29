@@ -1,13 +1,3 @@
-"""
-Minimal Streamlit app for viewing port simulation databases.
-
-UX goals:
-- Only two pages: Explore / Raw data
-- One simple control card
-- One plot card
-- Opinionated defaults
-"""
-
 from datetime import datetime
 from pathlib import Path
 import sqlite3
@@ -122,9 +112,11 @@ def make_plot(df: pd.DataFrame) -> go.Figure | None:
 
     fig = go.Figure()
 
-    for (source, metric), g in df.groupby(["source_name", "metric_name"]):
+    for (table, source, metric), g in df.groupby(
+        ["table", "source_name", "metric_name"]
+    ):
         unit = g["unit"].iloc[0]
-        label = f"{source} • {metric}"
+        label = f"{table} • {source} • {metric}"
         if unit:
             label += f" ({unit})"
 
@@ -158,6 +150,19 @@ def main():
     st.title("⚓ Port Simulation Viewer")
 
     # -----------------------
+    # Session state
+    # -----------------------
+
+    if "filters" not in st.session_state:
+        st.session_state.filters = {
+            "tables": [DATA_TABLES[0]],
+            "sources": [],
+            "metrics": [],
+            "start_date": None,
+            "end_date": None,
+        }
+
+    # -----------------------
     # Sidebar
     # -----------------------
 
@@ -186,14 +191,21 @@ def main():
             col1, col2, col3 = st.columns(3)
 
             with col1:
-                table = st.selectbox("Table", DATA_TABLES, format_func=str.capitalize)
+                selected_tables = st.multiselect(
+                    "Tables",
+                    DATA_TABLES,
+                    default=st.session_state.filters["tables"],
+                )
+                st.session_state.filters["tables"] = selected_tables
 
             with col2:
                 selected_sources = st.multiselect(
                     "Sources",
                     options=sources["source_name"].tolist(),
-                    default=sources["source_name"].head(1).tolist(),
+                    default=st.session_state.filters["sources"]
+                    or sources["source_name"].head(1).tolist(),
                 )
+                st.session_state.filters["sources"] = selected_sources
 
             with col3:
                 metric_labels = [
@@ -205,15 +217,30 @@ def main():
                 selected_metric_labels = st.multiselect(
                     "Metrics",
                     options=metric_labels,
-                    default=[],
+                    default=[
+                        l
+                        for l in metric_labels
+                        if label_to_name[l] in st.session_state.filters["metrics"]
+                    ],
                 )
+
                 selected_metrics = [label_to_name[l] for l in selected_metric_labels]
+                st.session_state.filters["metrics"] = selected_metrics
 
             col4, col5 = st.columns(2)
             with col4:
-                start_date = st.date_input("Start date", value=None)
+                start_date = st.date_input(
+                    "Start date",
+                    value=st.session_state.filters["start_date"],
+                )
+                st.session_state.filters["start_date"] = start_date
+
             with col5:
-                end_date = st.date_input("End date", value=None)
+                end_date = st.date_input(
+                    "End date",
+                    value=st.session_state.filters["end_date"],
+                )
+                st.session_state.filters["end_date"] = end_date
 
         # ---- Plot card ----
         with st.container(border=True):
@@ -250,19 +277,33 @@ def main():
                 else None
             )
 
-            df = load_data(
-                selected_db,
-                table,
-                source_ids,
-                metric_ids,
-                start_time,
-                end_time,
-            )
+            dfs: list[pd.DataFrame] = []
+
+            for table in selected_tables:
+                df = load_data(
+                    selected_db,
+                    table,
+                    source_ids,
+                    metric_ids,
+                    start_time,
+                    end_time,
+                )
+                if not df.empty:
+                    df["table"] = table
+                    dfs.append(df)
+
+            df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
             fig = make_plot(df)
 
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
+
+                tables_label = ", ".join(sorted(df["table"].unique()))
+                sources_label = ", ".join(sorted(df["source_name"].unique()))
+                metrics_label = ", ".join(sorted(df["metric_name"].unique()))
+
+                st.caption(f"**{tables_label} — {sources_label} — {metrics_label}**")
             else:
                 st.warning("No data found for the selected filters")
 
