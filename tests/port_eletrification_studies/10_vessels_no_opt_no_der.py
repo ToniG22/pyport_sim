@@ -168,7 +168,6 @@ def main():
         capacity=10.0,  #  Adjust PV capacity (kW DC)
         tilt=30.0,  #  Adjust panel tilt angle (degrees)
         azimuth=180.0,  #  Adjust panel azimuth (degrees, 180 = South-facing)
-        efficiency=0.95,  #  Adjust system efficiency (0.0-1.0)
         latitude=port.lat,
         longitude=port.lon,
     )
@@ -229,7 +228,7 @@ def main():
         mode=SimulationMode.BATCH,  #  Change to SimulationMode.REALTIME for real-time simulation
         db_path="10_vessels_no_opt_no_der.db",  #  Change database file path if needed
         use_optimizer=False,  #  Set to False to disable optimization (SCIP)
-        power_limit_mode=True
+        power_limit_mode=True,
     )
 
     # Initialize database

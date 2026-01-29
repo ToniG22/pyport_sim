@@ -6,11 +6,11 @@ from typing import Optional, Dict, List, Union
 
 from models import Port, BoatState, ChargerState, Trip
 from database import DatabaseManager
-from config import Settings, SimulationMode, OptimizerType
+from config import Settings, SimulationMode
 from simulation.trip_manager import TripManager
 from weather import OpenMeteoClient
 from forecasting import PortForecaster
-from optimization import PortOptimizer, ReliabilityOptimizer, ReliabilityFirstOptimizer, BaseOptimizer
+from optimization import BaseOptimizer
 
 
 class SimulationEngine:
@@ -93,28 +93,9 @@ class SimulationEngine:
         # Initialize optimizer (if enabled)
         self.optimizer = None
         self.use_optimizer = settings.use_optimizer
-        self.optimizer_type = getattr(
-            settings, "optimizer_type", OptimizerType.RELIABILITY
-        )
         if self.use_optimizer:
-            if self.optimizer_type == OptimizerType.RELIABILITY:
-                self.optimizer = ReliabilityOptimizer(
-                    port, db_manager, settings.timestep
-                )
-                print(f"\n🔧 Optimizer enabled (Reliability-focused)")
-            elif self.optimizer_type == OptimizerType.RELIABILITY_FIRST:
-                self.optimizer = ReliabilityFirstOptimizer(
-                    port, db_manager, settings.timestep
-                )
-                print(f"\n🔧 Optimizer enabled (Reliability-first)")
-            elif self.optimizer_type == OptimizerType.BASE:
-                self.optimizer = BaseOptimizer(
-                    port, db_manager, settings.timestep
-                )
-                print("\n🔧 Optimizer enabled (Base - contracted power constraint only)")
-            else:
-                self.optimizer = PortOptimizer(port, db_manager, settings.timestep)
-                print(f"\n🔧 Optimizer enabled (SCIP Cost-based)")
+            self.optimizer = BaseOptimizer(port, db_manager, settings.timestep)
+            print("\n🔧 Optimizer enabled (base - contracted power constraint only)")
 
         # Store latest forecasts for optimizer
         self.latest_energy_forecasts = []
@@ -871,11 +852,7 @@ class SimulationEngine:
                     None,
                 )
 
-                if (
-                    forecast
-                    and forecast.boat_states.get(boat_name, BoatState.IDLE)
-                    != BoatState.SAILING
-                ):
+                if forecast and forecast.boat_available.get(boat_name, 0) == 1:
                     # Boat is available - use maximum power
                     updated_schedules.append((timestamp, assigned_charger.max_power))
                 else:

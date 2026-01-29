@@ -27,6 +27,9 @@ DEFAULT_METRICS = (
     ("energy_stored", "kWh", "float"),
     ("bess_available", "kWh", "float"),
     ("bess_capacity", "kWh", "float"),
+    # Boat forecast metrics
+    ("boat_required_energy", "kWh", "float"),
+    ("boat_available", "", "int"),
     # Weather metrics
     ("temperature", "°C", "float"),
     ("humidity", "%", "float"),

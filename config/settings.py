@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 
 class SimulationMode(Enum):
@@ -10,17 +9,6 @@ class SimulationMode(Enum):
 
     REAL_TIME = "real_time"
     BATCH = "batch"
-
-
-class OptimizerType(Enum):
-    """Optimizer types for charging schedule optimization."""
-
-    COST = "cost"  # Cost-minimization optimizer (original PortOptimizer)
-    RELIABILITY = "reliability"  # Reliability-focused optimizer (ReliabilityOptimizer)
-    RELIABILITY_FIRST = (
-        "reliability_first"  # Reliability-first optimizer (ReliabilityFirstOptimizer)
-    )
-    BASE = "base"  # Base optimizer with single constraint: contracted_power limit
 
 
 @dataclass
@@ -33,7 +21,6 @@ class Settings:
         mode: Simulation mode (real-time or batch)
         db_path: Path to SQLite database file
         use_optimizer: Whether to use optimization for scheduling
-        optimizer_type: Type of optimizer to use (cost or reliability)
         power_limit_mode: Whether to enforce contracted power limit without optimization (baseline mode)
     """
 
@@ -41,9 +28,6 @@ class Settings:
     mode: SimulationMode = SimulationMode.BATCH
     db_path: str = "port_simulation.db"
     use_optimizer: bool = False  # Default: use rule-based control
-    optimizer_type: OptimizerType = (
-        OptimizerType.RELIABILITY_FIRST
-    )  # Default: reliability-focused
     power_limit_mode: bool = False  # Default: no power limiting (unlimited charging)
 
     def __post_init__(self):

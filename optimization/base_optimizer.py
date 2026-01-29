@@ -112,12 +112,10 @@ class BaseOptimizer:
         # PRE-COMPUTE
         # ===================================================================
         
-        # PV power at each timestep (kW)
-        # Verify PV power do not divide by timestep_hours
+        # PV power at each timestep (kW) from forecaster
         pv_power = {}
         for t in timesteps:
-            forecast = energy_forecasts[t]
-            pv_power[t] = forecast.power_active_production_kwh / self.timestep_hours if self.timestep_hours > 0 else 0
+            pv_power[t] = energy_forecasts[t].power_active_production_kw
         
 
         load = quicksum(charger_power[c][t] for c in range(num_chargers))

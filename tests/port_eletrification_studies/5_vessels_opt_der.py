@@ -1,7 +1,7 @@
 """Main entry point for the electric port simulator."""
 
 from models import Port, Boat, Charger, PV, BESS, BESSControlStrategy
-from config import Settings, SimulationMode, OptimizerType
+from config import Settings, SimulationMode
 from database import DatabaseManager
 from simulation import SimulationEngine
 
@@ -153,7 +153,6 @@ def main():
         mode=SimulationMode.BATCH,  #  Change to SimulationMode.REALTIME for real-time simulation
         db_path="5_vessels_opt_der.db",  #  Change database file path if needed
         use_optimizer=True,  #  Set to False to disable optimization
-        optimizer_type=OptimizerType.BASE,  # Use reliability-focused optimizer
     )
 
     # Initialize database

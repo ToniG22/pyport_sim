@@ -103,7 +103,6 @@ def main():
         capacity=10.0,  #  Adjust PV capacity (kW DC)
         tilt=30.0,  #  Adjust panel tilt angle (degrees)
         azimuth=180.0,  #  Adjust panel azimuth (degrees, 180 = South-facing)
-        efficiency=0.95,  #  Adjust system efficiency (0.0-1.0)
         latitude=port.lat,
         longitude=port.lon,
     )
