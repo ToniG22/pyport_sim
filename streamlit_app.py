@@ -102,7 +102,7 @@ def load_data(
 # -----------------------
 
 
-def make_plot(df: pd.DataFrame) -> go.Figure | None:
+def make_plot(df: pd.DataFrame, show_legend: bool) -> go.Figure | None:
     if df.empty:
         return None
 
@@ -134,6 +134,7 @@ def make_plot(df: pd.DataFrame) -> go.Figure | None:
         yaxis_title="Value",
         hovermode="x unified",
         height=500,
+        showlegend=show_legend,  # 👈 toggle applied here
         legend=dict(orientation="h", y=1.02),
         margin=dict(l=10, r=10, t=40, b=10),
     )
@@ -246,6 +247,9 @@ def main():
         with st.container(border=True):
             st.markdown("### Time series")
 
+            # 👇 Legend toggle
+            show_legend = st.toggle("Show legend", value=True)
+
             if not selected_sources and not selected_metrics:
                 st.info("Select a source or a metric to begin")
                 return
@@ -294,7 +298,7 @@ def main():
 
             df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-            fig = make_plot(df)
+            fig = make_plot(df, show_legend)
 
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
