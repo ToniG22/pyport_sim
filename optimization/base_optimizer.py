@@ -1,7 +1,7 @@
-"""Base optimizer with single constraint: do not exceed contracted_power.
+"""Base optimizer: cost vs SOC tradeoff with contracted_power limit.
 
-This optimizer maximizes charging power while respecting the contracted power limit.
-No other constraints are applied.
+Minimizes cost minus reward for fuller boat SOC (using port tariff).
+Subject to grid <= contracted_power.
 """
 
 from datetime import datetime, timedelta
@@ -23,6 +23,7 @@ class BaseOptimizationResult:
     bess_schedules: Dict[str, List[Tuple[datetime, float]]]
     peak_power_kw: float
     total_energy_kwh: float
+    total_cost: float
 
 
 class BaseOptimizer:
@@ -42,17 +43,21 @@ class BaseOptimizer:
         energy_forecasts: List[EnergyForecast],
     ) -> BaseOptimizationResult:
         """
-        Optimize charging schedule with single constraint: do not exceed contracted_power.
+        Minimize cost minus reward for fuller boat SOC, subject to grid <= contracted_power.
+
+        Objective: cost (grid × tariff) - soc_reward_per_kwh × total_energy_delivered.
+        Rewards charging boats closer to 100% SOC. Single constraint: grid <= contracted_power.
 
         Args:
             forecast_date: Date to optimize for
             energy_forecasts: Energy forecasts for the day
-            trip_assignments: Trip assignments per boat (not used in base optimizer)
 
         Returns:
             BaseOptimizationResult with optimal schedules
         """
-        print("     🎯 Running base optimization (contracted power constraint only)...")
+        print(
+            "     🎯 Running base optimization (cost min + SOC reward)..."
+        )
 
         T = len(energy_forecasts)
         timesteps = list(range(T))
@@ -74,14 +79,22 @@ class BaseOptimizer:
 
         # Charger power at each timestep
         charger_power = {}
+        charger_on = {}  # binary: 1 if charger has power > 0
+        max_charger_power = (
+            max(c.max_power for c in self.port.chargers) if self.port.chargers else 22.0
+        )
         for c_idx in range(num_chargers):
             charger_power[c_idx] = {}
+            charger_on[c_idx] = {}
             for t in timesteps:
                 charger_power[c_idx][t] = model.addVar(
                     name=f"p_{c_idx}_{t}",
                     vtype="C",
                     lb=0,
                     ub=self.port.chargers[c_idx].max_power,
+                )
+                charger_on[c_idx][t] = model.addVar(
+                    name=f"on_{c_idx}_{t}", vtype="B", lb=0, ub=1
                 )
 
         # Grid import at each timestep
@@ -111,17 +124,31 @@ class BaseOptimizer:
         for t in timesteps:
             pv_power[t] = energy_forecasts[t].power_active_production_kw
 
+        # Tariff price per kWh at each timestep (from port)
+        tariff_price = {}
+        for t in timesteps:
+            ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+            tariff_price[t] = self.port.get_tariff_price(ts)
+
+        # Boats needing charge at each t (available + have required energy > 0)
+        def _boats_needing_at(t_idx: int) -> int:
+            if not energy_forecasts or t_idx >= len(energy_forecasts):
+                return 0
+            fc = energy_forecasts[t_idx]
+            return sum(
+                1
+                for b, need in fc.boat_required_energy_kwh.items()
+                if need > 0 and fc.boat_available.get(b, 0) == 1
+            )
+
         # ===================================================================
         # CONSTRAINTS
         # ===================================================================
 
         for t in timesteps:
-            # Total charger power
             total_charger = quicksum(charger_power[c][t] for c in range(num_chargers))
 
-            # CONSTRAINT: Power balance
-            # Grid + PV + BESS >= Chargers
-            # If PV is greater add a relaxation
+            # Power balance: grid + PV + BESS >= charger demand
             if self.port.bess_systems:
                 model.addCons(
                     grid_import[t] + pv_power[t] + bess_discharge[t] >= total_charger,
@@ -129,25 +156,69 @@ class BaseOptimizer:
                 )
             else:
                 model.addCons(
-                    grid_import[t] + pv_power[t] == total_charger, name=f"balance_{t}"
+                    grid_import[t] + pv_power[t] >= total_charger, name=f"balance_{t}"
                 )
 
-            # CONSTRAINT: Do not exceed contracted_power
-            # This is the ONLY constraint (besides power balance)
+            # Single constraint: grid must not exceed contracted_power
             model.addCons(
                 grid_import[t] <= self.port.contracted_power,
-                name=f"contracted_power_limit_{t}",
+                name=f"contracted_power_{t}",
+            )
+
+            # Link charger_on to charger_power (0.01 kW min when on)
+            for c in range(num_chargers):
+                model.addCons(
+                    charger_power[c][t] <= max_charger_power * charger_on[c][t],
+                    name=f"link_ub_{c}_{t}",
+                )
+                model.addCons(
+                    charger_power[c][t] >= 0.01 * charger_on[c][t],
+                    name=f"link_lb_{c}_{t}",
+                )
+
+            # At least N chargers on when N boats need charge (enables parallel charging)
+            n_needing = _boats_needing_at(t)
+            if n_needing > 0:
+                model.addCons(
+                    quicksum(charger_on[c][t] for c in range(num_chargers))
+                    >= min(n_needing, num_chargers),
+                    name=f"parallel_{t}",
+                )
+
+        # Must meet boat energy demand (otherwise cost min → all zeros, no charging)
+        demand_from_forecast = (
+            sum(energy_forecasts[0].boat_required_energy_kwh.values())
+            if energy_forecasts
+            else 0.0
+        )
+        if demand_from_forecast > 0:
+            model.addCons(
+                quicksum(
+                    charger_power[c][t]
+                    for c in range(num_chargers)
+                    for t in timesteps
+                )
+                * self.timestep_hours
+                >= demand_from_forecast,
+                name="min_demand",
             )
 
         # ===================================================================
-        # OBJECTIVE: Maximize total charging power
+        # OBJECTIVE: Minimize cost - reward for fuller SOC
         # ===================================================================
 
-        total_charging = quicksum(
-            charger_power[c][t] for c in range(num_chargers) for t in timesteps
+        # Cost = sum over t of (grid_import[t] kW × price[t] €/kWh × dt h)
+        total_cost = quicksum(
+            grid_import[t] * tariff_price[t] * self.timestep_hours
+            for t in timesteps
         )
-
-        model.setObjective(total_charging, "maximize")
+        # Reward: value assigned to each kWh delivered to boats (fuller SOC)
+        total_energy = quicksum(
+            charger_power[c][t] for c in range(num_chargers) for t in timesteps
+        ) * self.timestep_hours
+        soc_reward = 0.15 * total_energy  # built-in: reward fuller SOC (€/kWh)
+        # Minimize cost minus reward → prefers cheaper charging AND fuller boats
+        model.setObjective(total_cost - soc_reward, "minimize")
 
         # ===================================================================
         # SOLVE
@@ -166,6 +237,7 @@ class BaseOptimizer:
 
         peak_power = 0.0
         total_energy = 0.0
+        total_cost = 0.0
 
         if status in ["optimal", "bestsollimit", "timelimit"]:
             try:
@@ -183,6 +255,9 @@ class BaseOptimizer:
                     peak_power = max(peak_power, power_this_t)
                     total_energy += power_this_t * self.timestep_hours
 
+                    grid_val = max(0, model.getVal(grid_import[t]))
+                    total_cost += grid_val * tariff_price[t] * self.timestep_hours
+
                 # BESS schedules
                 if self.port.bess_systems:
                     for bess in self.port.bess_systems:
@@ -199,7 +274,8 @@ class BaseOptimizer:
 
                 print("     ✓ Base optimization complete")
                 print(
-                    f"       Peak power: {peak_power:.1f} kW, Energy: {total_energy:.1f} kWh"
+                    f"       Peak power: {peak_power:.1f} kW, Energy: {total_energy:.1f} kWh, "
+                    f"Cost: {total_cost:.2f}"
                 )
 
             except Exception as e:
@@ -215,6 +291,7 @@ class BaseOptimizer:
             bess_schedules=bess_schedules,
             peak_power_kw=peak_power,
             total_energy_kwh=total_energy,
+            total_cost=total_cost,
         )
 
     def _create_fallback(
@@ -222,23 +299,41 @@ class BaseOptimizer:
     ) -> BaseOptimizationResult:
         """Fallback if SCIP fails - use max power up to contracted limit."""
         T = len(energy_forecasts)
-        charger_power = self.port.chargers[0].max_power if self.port.chargers else 22.0
-        max_chargers = min(
-            len(self.port.chargers), int(self.port.contracted_power / charger_power)
+        pwr_per_charger = (
+            self.port.chargers[0].max_power if self.port.chargers else 22.0
         )
+        max_chargers = min(
+            len(self.port.chargers),
+            int(self.port.contracted_power / pwr_per_charger),
+        )
+        total_charger_pwr = max_chargers * pwr_per_charger
 
         charger_schedules = {}
+        fallback_cost = 0.0
         for c_idx, charger in enumerate(self.port.chargers):
             charger_schedules[charger.name] = []
             for t in range(T):
-                timestamp = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+                timestamp = forecast_date + timedelta(
+                    seconds=t * self.timestep_seconds
+                )
                 power = charger.max_power if c_idx < max_chargers else 0.0
                 charger_schedules[charger.name].append((timestamp, power))
+
+        for t in range(T):
+            pv = energy_forecasts[t].power_active_production_kw
+            grid = max(0, total_charger_pwr - pv)
+            ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+            fallback_cost += (
+                grid * self.port.get_tariff_price(ts) * self.timestep_hours
+            )
 
         bess_schedules = {}
         for bess in self.port.bess_systems:
             bess_schedules[bess.name] = [
-                (forecast_date + timedelta(seconds=t * self.timestep_seconds), 0.0)
+                (
+                    forecast_date + timedelta(seconds=t * self.timestep_seconds),
+                    0.0,
+                )
                 for t in range(T)
             ]
 
@@ -246,8 +341,9 @@ class BaseOptimizer:
             status="fallback",
             charger_schedules=charger_schedules,
             bess_schedules=bess_schedules,
-            peak_power_kw=max_chargers * charger_power,
-            total_energy_kwh=max_chargers * charger_power * T * self.timestep_hours,
+            peak_power_kw=total_charger_pwr,
+            total_energy_kwh=total_charger_pwr * T * self.timestep_hours,
+            total_cost=fallback_cost,
         )
 
     def save_schedules_to_db(self, result: BaseOptimizationResult) -> None:
