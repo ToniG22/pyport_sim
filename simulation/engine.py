@@ -93,7 +93,9 @@ class SimulationEngine:
         self.optimizer = None
         self.use_optimizer = settings.use_optimizer
         if self.use_optimizer:
-            self.optimizer = BaseOptimizer(port, db_manager, settings.timestep)
+            self.optimizer = BaseOptimizer(
+                port, db_manager, settings.timestep, settings.trip_schedule
+            )
             print("\n🔧 Optimizer enabled (base - contracted power constraint only)")
 
         # Store latest forecasts for optimizer
@@ -717,7 +719,7 @@ class SimulationEngine:
                 self.boat_charger_map.pop(boat_name, None)
 
         # ------------------------------------------------------------------
-        # Helper: next trip time for sorting priority
+        # Helper: next trip time for sorting priority (earliest future departure)
         # ------------------------------------------------------------------
         def next_trip_time(boat):
             trips = self.trip_manager.get_trips_for_date(
@@ -725,11 +727,15 @@ class SimulationEngine:
             )
             if not trips:
                 return datetime.max
-            slot_idx = min(len(trips) - 1, len(self.trip_schedule) - 1)
-            if slot_idx < 0:
-                return datetime.max
-            start_hour = self.trip_schedule[slot_idx][0]
-            return self.current_datetime.replace(hour=start_hour, minute=0, second=0)
+            # Find the first trip slot whose departure time is still in the future
+            for slot_idx in range(min(len(trips), len(self.trip_schedule))):
+                start_hour = self.trip_schedule[slot_idx][0]
+                dep_time = self.current_datetime.replace(
+                    hour=start_hour, minute=0, second=0, microsecond=0
+                )
+                if dep_time >= self.current_datetime:
+                    return dep_time
+            return datetime.max
 
         # ------------------------------------------------------------------
         # Sort boats by urgency (earliest trip, then lowest SOC)
