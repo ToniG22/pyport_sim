@@ -203,8 +203,7 @@ def main():
                 selected_sources = st.multiselect(
                     "Sources",
                     options=sources["source_name"].tolist(),
-                    default=st.session_state.filters["sources"]
-                    or sources["source_name"].head(1).tolist(),
+                    default=st.session_state.filters["sources"],
                 )
                 st.session_state.filters["sources"] = selected_sources
 

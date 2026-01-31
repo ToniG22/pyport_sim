@@ -36,7 +36,7 @@ def main():
         length=8.5,  #  Adjust length (m)
         battery_capacity=100,  #  Adjust battery capacity (kWh)
         range_speed=16.0,  #  Adjust range speed (knots)
-        soc=0.30,  #  Adjust initial state of charge (0.0-1.0)
+        soc=0.50,  #  Adjust initial state of charge (0.0-1.0)
     )
 
     boat2 = Boat(
