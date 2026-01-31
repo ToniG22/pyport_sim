@@ -1,6 +1,5 @@
 """Base optimizer: minimize cost subject to import <= contracted_power."""
 
-import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
@@ -26,33 +25,19 @@ class BaseOptimizer:
     """Minimize cost. Single constraint: grid import <= contracted_power."""
 
     def __init__(
-        self,
-        port: Port,
-        db_manager: DatabaseManager,
-        timestep_seconds: int = 900,
-        trip_schedule: tuple = ((9, 0), (14, 1)),
+        self, port: Port, db_manager: DatabaseManager, timestep_seconds: int = 900
     ):
         self.port = port
         self.db_manager = db_manager
         self.timestep_seconds = timestep_seconds
         self.timestep_hours = timestep_seconds / 3600.0
-        # (hour_utc, slot_index) per day - from config/settings
-        self.trip_schedule = trip_schedule
 
     def optimize_daily_schedule(
         self,
         forecast_date: datetime,
         energy_forecasts: List[EnergyForecast],
     ) -> BaseOptimizationResult:
-        """Minimize cost and trip delays.
-
-        - Deliver required energy by trip_schedule (9h, 14h) when possible.
-        - Exponential penalty for late delivery (1h late < 4h late).
-        - Delayed boats can charge after their target time (14–17 etc.) so they
-          leave as early as possible; fewer boats delay, delayed boats charge
-          to depart ASAP.
-        - Grid import <= contracted_power.
-        """
+        """Minimize cost (grid × tariff) s.t. grid_import <= contracted_power."""
         print("     Running base optimization (minimize cost)...")
 
         T = len(energy_forecasts)
@@ -82,75 +67,15 @@ class BaseOptimizer:
                 name=f"grid_{t}", vtype="C", lb=0, ub=self.port.contracted_power
             )
 
-        # Per boat: max required energy over timesteps (from forecast)
+        # Per boat (source): max required energy over timesteps; sum those, then × 2
         per_boat_kwh = {}
         for t in timesteps:
             for boat, kwh in energy_forecasts[t].boat_required_energy_kwh.items():
                 per_boat_kwh[boat] = max(per_boat_kwh.get(boat, 0), kwh)
-
-        # Boats in deterministic order; target timestep from trip_schedule (boat i -> slot i % num_slots)
-        boat_names = sorted(b.name for b in self.port.boats)
-        num_boats = len(boat_names)
-        num_slots = len(self.trip_schedule) if self.trip_schedule else 1
-        # Target = last timestep that ends by departure (energy delivered by start of hour)
-        target_timestep = {}
-        for i, name in enumerate(boat_names):
-            hour_utc = self.trip_schedule[i % num_slots][0]
-            # Timestep that ends at hour_utc:00 (so energy ready by departure)
-            t_end_at_hour = (hour_utc * 3600) // self.timestep_seconds
-            target_timestep[i] = max(0, t_end_at_hour - 1)
-
-        charger_to_boat = {}
-        if num_boats > 0:
-            # Power from charger c to boat b at time t.
-            # Allow charging when: (1) boat is at port (forecast), or (2) after target
-            # time (delayed boats still at port can charge to leave as early as possible).
-            for c_idx in range(num_chargers):
-                charger_max = self.port.chargers[c_idx].max_power
-                charger_to_boat[c_idx] = {}
-                for b_idx in range(num_boats):
-                    charger_to_boat[c_idx][b_idx] = {}
-                    target_t = target_timestep[b_idx]
-                    for t in timesteps:
-                        avail = energy_forecasts[t].boat_available.get(
-                            boat_names[b_idx], 0
-                        )
-                        # Delayed boats: allow charging after target time (14–17 etc.)
-                        delayed_can_charge = t > target_t
-                        ub = charger_max if (avail or delayed_can_charge) else 0.0
-                        charger_to_boat[c_idx][b_idx][t] = model.addVar(
-                            name=f"x_{c_idx}_{b_idx}_{t}",
-                            vtype="C",
-                            lb=0,
-                            ub=ub,
-                        )
-            # Link: charger total power = sum over boats
-            for c_idx in range(num_chargers):
-                for t in timesteps:
-                    model.addCons(
-                        quicksum(
-                            charger_to_boat[c_idx][b_idx][t]
-                            for b_idx in range(num_boats)
-                        )
-                        == charger_power[c_idx][t],
-                        name=f"link_c{c_idx}_t{t}",
-                    )
-            # Per-boat min energy (deliver required energy from forecast)
-            for b_idx in range(num_boats):
-                required_b = per_boat_kwh.get(boat_names[b_idx], 0.0)
-                if required_b <= 0:
-                    continue
-                model.addCons(
-                    quicksum(
-                        charger_to_boat[c_idx][b_idx][t] * self.timestep_hours
-                        for c_idx in range(num_chargers)
-                        for t in timesteps
-                    )
-                    >= required_b,
-                    name=f"min_energy_{boat_names[b_idx]}",
-                )
+        energy_required_kwh = sum(per_boat_kwh.values()) * 2
 
         energy_required_boat_kwh = sum(b.battery_capacity * 2 for b in self.port.boats)
+
         print(f"Energy required: {energy_required_boat_kwh} kWh")
 
         # at least 2× (sum of energy required per boat)
@@ -185,32 +110,11 @@ class BaseOptimizer:
                 grid_import[t] + pv_power[t] == charger_demand, name=f"balance_{t}"
             )
 
-        # Objective: grid cost + exponential penalty for late delivery (1h late < 4h late)
+        # Objective: minimize cost
         total_cost = quicksum(
             grid_import[t] * tariff_price[t] * self.timestep_hours for t in timesteps
         )
-        schedule_penalty = 0.0
-        if num_boats > 0:
-            alpha = 0.5  # per-timestep exponent (4 steps = 1h -> e^2, 16 steps = 4h -> e^8)
-            base_penalty = 1.0
-            for b_idx in range(num_boats):
-                target_t = target_timestep[b_idx]
-                required_b = per_boat_kwh.get(boat_names[b_idx], 0.0)
-                if required_b <= 0:
-                    continue
-                for t in timesteps:
-                    if t <= target_t:
-                        continue  # no penalty for delivery by target timestep
-                    weight = base_penalty * math.exp(alpha * (t - target_t))
-                    schedule_penalty += (
-                        weight
-                        * quicksum(
-                            charger_to_boat[c_idx][b_idx][t]
-                            for c_idx in range(num_chargers)
-                        )
-                        * self.timestep_hours
-                    )
-        model.setObjective(total_cost + schedule_penalty, "minimize")
+        model.setObjective(total_cost, "minimize")
 
         model.optimize()
         status = model.getStatus()
