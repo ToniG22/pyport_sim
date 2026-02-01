@@ -1,13 +1,15 @@
 """Base optimizer: minimize cost subject to import <= contracted_power."""
 
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
-from dataclasses import dataclass
 
 from pyscipopt import Model, quicksum
-from models import Port
+
 from database import DatabaseManager
 from forecasting import EnergyForecast
+from models import Port
 
 
 @dataclass
@@ -37,7 +39,7 @@ class BaseOptimizer:
         forecast_date: datetime,
         energy_forecasts: List[EnergyForecast],
     ) -> BaseOptimizationResult:
-        """Minimize cost (grid × tariff) s.t. grid_import <= contracted_power."""
+        """Minimize cost (grid x tariff) s.t. grid_import <= contracted_power."""
         print("     Running base optimization (minimize cost)...")
 
         T = len(energy_forecasts)
@@ -72,42 +74,41 @@ class BaseOptimizer:
         for t in timesteps:
             for boat, kwh in energy_forecasts[t].boat_required_energy_kwh.items():
                 per_boat_kwh[boat] = max(per_boat_kwh.get(boat, 0), kwh)
-        energy_required_kwh = sum(per_boat_kwh.values()) * 2
 
-        energy_required_boat_kwh = sum(b.battery_capacity * 2 for b in self.port.boats)
+        print(f"Energy required: {per_boat_kwh}")
 
-        print(f"Energy required: {energy_required_boat_kwh} kWh")
+        # Deadlines
+        deadlines = self._extract_deadlines(energy_forecasts)
+        print(f"Deadlines: {deadlines}")
 
-        # at least 2× (sum of energy required per boat)
-        model.addCons(
-            quicksum(
-                charger_power[c_idx][t] * self.timestep_hours
-                for c_idx in range(num_chargers)
-                for t in timesteps
-            )
-            >= energy_required_boat_kwh,
-            name="min_total_energy",
-        )
-
-        # Pre-compute
+        # Pre-compute PV forecast
         pv_power = {}
-        if self.port.pv_systems:
-            for t in timesteps:
-                pv_power[t] = energy_forecasts[t].power_active_production_kw
-        else:
-            for t in timesteps:
-                pv_power[t] = 0.0
+        for t in timesteps:
+            pv_power[t] = (
+                energy_forecasts[t].power_active_production_kw
+                if self.port.pv_systems
+                else 0.0
+            )
 
+        # PV usage variables (allows curtailment)
+        pv_used = {}
+        for t in timesteps:
+            pv_used[t] = model.addVar(
+                name=f"pv_used_{t}", vtype="C", lb=0, ub=pv_power[t]
+            )
+
+        # Tariffs
         tariff_price = {}
         for t in timesteps:
             ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
             tariff_price[t] = self.port.get_tariff_price(ts)
 
-        # Power balance: grid + PV == sum(charger_power)
+        # Power balance: grid + pv_used == sum(charger_power)
         for t in timesteps:
             charger_demand = quicksum(charger_power[c][t] for c in range(num_chargers))
             model.addCons(
-                grid_import[t] + pv_power[t] == charger_demand, name=f"balance_{t}"
+                grid_import[t] + pv_used[t] == charger_demand,
+                name=f"balance_{t}",
             )
 
         # Objective: minimize cost
@@ -197,30 +198,24 @@ class BaseOptimizer:
             total_cost=cost,
         )
 
-    def _v2gStateEq(self, boat_available, boat, t):
-        if boat_available[boat, t] == 0:  # If vehicle is not scheduled
-            return boat.soc[t] == 0 # valor que tinha - custo da viagem
-        elif t > 1:  # If not the first time step
-            if (boat_available[boat, t - 1] == 1) & (
-                boat_available[boat, t] == 1
-            ):  # If was and is currently connected
-                return (
-                    boat.soc[t]
-                    == boat.soc[t - 1]
-                    + boat.charge[t] * boat.charger.efficiency
-                    - boat.discharge[t] / boat.charger.efficiency
+    def _extract_deadlines(self, energy_forecasts: List[EnergyForecast]):
+        """Extract deadlines from energy forecasts."""
+        deadlines = defaultdict(list)
+
+        T = len(energy_forecasts)
+        boats = energy_forecasts[0].boat_required_energy_kwh.keys()
+
+        for boat in boats:
+            for t in range(T - 1):
+                req_now = energy_forecasts[t].boat_required_energy_kwh.get(boat, 0.0)
+                req_next = energy_forecasts[t + 1].boat_required_energy_kwh.get(
+                    boat, 0.0
                 )
-            elif (boat_available[boat, t - 1] == 0) & (
-                boat_available[boat, t] == 1
-            ):  # If became connected
-                return (
-                    boat.soc[t]
-                    == # soc do departure - custo da viagem
-                    boat.soc[t - 1] - boat.discharge[t] / boat.charger.efficiency
-                    + boat.charge[t] * boat.charger.efficiency
-                    - boat.discharge[t] / boat.charger.efficiency
-                )
-        return None
+
+                if req_now > 0 and req_next == 0:
+                    deadlines[boat].append((t, req_now))
+
+        return deadlines
 
     def save_schedules_to_db(self, result: BaseOptimizationResult) -> None:
         """Save schedules to database."""
