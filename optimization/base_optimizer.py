@@ -14,8 +14,6 @@ from models import Port
 
 @dataclass
 class BaseOptimizationResult:
-    """Result from base optimization."""
-
     status: str
     charger_schedules: Dict[str, List[Tuple[datetime, float]]]
     peak_power_kw: float
@@ -24,7 +22,7 @@ class BaseOptimizationResult:
 
 
 class BaseOptimizer:
-    """Minimize cost. Single constraint: grid import <= contracted_power."""
+    """Minimize cost. Grid import constrained by contracted power."""
 
     def __init__(
         self, port: Port, db_manager: DatabaseManager, timestep_seconds: int = 900
@@ -39,42 +37,84 @@ class BaseOptimizer:
         forecast_date: datetime,
         energy_forecasts: List[EnergyForecast],
     ) -> BaseOptimizationResult:
-        """Minimize cost (grid x tariff) s.t. grid_import <= contracted_power."""
         print("     Running base optimization (minimize cost)...")
 
         T = len(energy_forecasts)
         timesteps = list(range(T))
-        num_chargers = len(self.port.chargers)
-        num_boats = len(self.port.boats)
+        chargers = self.port.chargers
+        boats = list(energy_forecasts[0].boat_required_energy_kwh.keys())
+
+        num_chargers = len(chargers)
+        num_boats = len(boats)
+
         print(
-            f"        {num_chargers} chargers, {num_boats} boats, {T} timesteps, contracted_power={self.port.contracted_power} kW"
+            f"        {num_chargers} chargers, {num_boats} boats, "
+            f"{T} timesteps, contracted_power={self.port.contracted_power} kW"
         )
 
         model = Model("base_optimizer")
         model.hideOutput()
         model.setRealParam("limits/time", 30.0)
 
+        # ----------------------------------------------------
         # Decision variables
-        charger_power = {}
-        for c_idx in range(num_chargers):
-            charger_power[c_idx] = {}
-            ub = self.port.chargers[c_idx].max_power
+        # p[c][b][t] = power (kW) delivered from charger c to boat b at time t
+        # ----------------------------------------------------
+        p = {}
+        for c_idx, charger in enumerate(chargers):
+            p[c_idx] = {}
+            for b in boats:
+                p[c_idx][b] = {}
+                for t in timesteps:
+                    p[c_idx][b][t] = model.addVar(
+                        name=f"p_{c_idx}_{b}_{t}",
+                        vtype="C",
+                        lb=0.0,
+                        ub=charger.max_power,
+                    )
+
+        # Charger capacity constraints
+        for c_idx, charger in enumerate(chargers):
             for t in timesteps:
-                charger_power[c_idx][t] = model.addVar(
-                    name=f"p_{c_idx}_{t}", vtype="C", lb=0, ub=ub
+                model.addCons(
+                    quicksum(p[c_idx][b][t] for b in boats) <= charger.max_power,
+                    name=f"charger_cap_{c_idx}_{t}",
                 )
 
+        # Grid import
         grid_import = {}
         for t in timesteps:
             grid_import[t] = model.addVar(
-                name=f"grid_{t}", vtype="C", lb=0, ub=self.port.contracted_power
+                name=f"grid_{t}",
+                vtype="C",
+                lb=0.0,
+                ub=self.port.contracted_power,
             )
 
-        # Deadlines
+        # ----------------------------------------------------
+        # Deadline constraints (FIXED)
+        # ----------------------------------------------------
         deadlines = self._extract_deadlines(energy_forecasts)
         print(f"Deadlines: {deadlines}")
 
-        # Pre-compute PV forecast
+        for boat_name, boat_deadlines in deadlines.items():
+            if boat_name not in boats:
+                continue
+
+            for t_deadline, energy_required in boat_deadlines:
+                model.addCons(
+                    quicksum(
+                        p[c_idx][boat_name][t] * self.timestep_hours
+                        for c_idx in range(num_chargers)
+                        for t in range(t_deadline + 1)
+                    )
+                    >= energy_required,
+                    name=f"deadline_{boat_name}_{t_deadline}",
+                )
+
+        # ----------------------------------------------------
+        # PV production
+        # ----------------------------------------------------
         pv_power = {}
         for t in timesteps:
             pv_power[t] = (
@@ -83,69 +123,83 @@ class BaseOptimizer:
                 else 0.0
             )
 
-        # PV usage
         pv_used = {}
         for t in timesteps:
             pv_used[t] = model.addVar(
-                name=f"pv_used_{t}", vtype="C", lb=0, ub=pv_power[t]
+                name=f"pv_used_{t}",
+                vtype="C",
+                lb=0.0,
+                ub=pv_power[t],
             )
 
+        # ----------------------------------------------------
         # Tariffs
+        # ----------------------------------------------------
         tariff_price = {}
         for t in timesteps:
             ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
             tariff_price[t] = self.port.get_tariff_price(ts)
 
-        # Power balance: grid + pv_used == sum(charger_power)
+        # ----------------------------------------------------
+        # Power balance
+        # ----------------------------------------------------
         for t in timesteps:
-            charger_demand = quicksum(charger_power[c][t] for c in range(num_chargers))
+            total_charger_power = quicksum(
+                p[c_idx][b][t] for c_idx in range(num_chargers) for b in boats
+            )
+
             model.addCons(
-                grid_import[t] + pv_used[t] == charger_demand,
+                grid_import[t] + pv_used[t] == total_charger_power,
                 name=f"balance_{t}",
             )
 
+        # ----------------------------------------------------
         # Objective: minimize cost
+        # ----------------------------------------------------
         total_cost = quicksum(
             grid_import[t] * tariff_price[t] * self.timestep_hours for t in timesteps
         )
         model.setObjective(total_cost, "minimize")
 
+        # ----------------------------------------------------
+        # Solve
+        # ----------------------------------------------------
         model.optimize()
         status = model.getStatus()
         print(f"        SCIP status: {status}")
 
+        if status != "optimal":
+            raise Exception("Optimization did not find optimal solution.")
+
+        # ----------------------------------------------------
         # Extract results
-        charger_schedules = {c.name: [] for c in self.port.chargers}
+        # ----------------------------------------------------
+        charger_schedules = {c.name: [] for c in chargers}
         peak_power = 0.0
         total_energy = 0.0
         total_cost_val = 0.0
 
-        if status in ["optimal", "bestsollimit", "timelimit"]:
-            try:
-                for t in timesteps:
-                    timestamp = forecast_date + timedelta(
-                        seconds=t * self.timestep_seconds
-                    )
-                    power_this_t = 0.0
-                    for c_idx, charger in enumerate(self.port.chargers):
-                        p = max(0, model.getVal(charger_power[c_idx][t]))
-                        charger_schedules[charger.name].append((timestamp, p))
-                        power_this_t += p
-                    peak_power = max(peak_power, power_this_t)
-                    total_energy += power_this_t * self.timestep_hours
-                    g = max(0, model.getVal(grid_import[t]))
-                    total_cost_val += g * tariff_price[t] * self.timestep_hours
+        for t in timesteps:
+            timestamp = forecast_date + timedelta(seconds=t * self.timestep_seconds)
 
-                print("     Base optimization complete")
-                print(
-                    f"       Peak: {peak_power:.1f} kW, Energy: {total_energy:.1f} kWh, Cost: {total_cost_val:.2f}"
-                )
-            except Exception as e:
-                print(f"     Error extracting results: {e}, using fallback")
-                return self._create_fallback(forecast_date, energy_forecasts)
-        else:
-            print(f"     SCIP failed ({status}), using fallback")
-            return self._create_fallback(forecast_date, energy_forecasts)
+            power_this_t = 0.0
+            for c_idx, charger in enumerate(chargers):
+                p_c_t = sum(max(0.0, model.getVal(p[c_idx][b][t])) for b in boats)
+                charger_schedules[charger.name].append((timestamp, p_c_t))
+                power_this_t += p_c_t
+
+            peak_power = max(peak_power, power_this_t)
+            total_energy += power_this_t * self.timestep_hours
+
+            g = max(0.0, model.getVal(grid_import[t]))
+            total_cost_val += g * tariff_price[t] * self.timestep_hours
+
+        print("     Base optimization complete")
+        print(
+            f"       Peak: {peak_power:.1f} kW, "
+            f"Energy: {total_energy:.1f} kWh, "
+            f"Cost: {total_cost_val:.2f}"
+        )
 
         return BaseOptimizationResult(
             status=status,
@@ -155,46 +209,11 @@ class BaseOptimizer:
             total_cost=total_cost_val,
         )
 
-    def _create_fallback(
-        self, forecast_date: datetime, energy_forecasts: List[EnergyForecast]
-    ) -> BaseOptimizationResult:
-        """Fallback if SCIP fails."""
-        T = len(energy_forecasts)
-        pwr = self.port.chargers[0].max_power if self.port.chargers else 22.0
-        max_chargers = min(
-            len(self.port.chargers),
-            int(self.port.contracted_power / pwr),
-        )
-        total_pwr = max_chargers * pwr
-
-        charger_schedules = {}
-        for c_idx, charger in enumerate(self.port.chargers):
-            charger_schedules[charger.name] = []
-            for t in range(T):
-                ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
-                charger_schedules[charger.name].append(
-                    (ts, charger.max_power if c_idx < max_chargers else 0.0)
-                )
-
-        cost = 0.0
-        for t in range(T):
-            pv = energy_forecasts[t].power_active_production_kw
-            grid = max(0, total_pwr - pv)
-            ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
-            cost += grid * self.port.get_tariff_price(ts) * self.timestep_hours
-
-        return BaseOptimizationResult(
-            status="fallback",
-            charger_schedules=charger_schedules,
-            peak_power_kw=total_pwr,
-            total_energy_kwh=total_pwr * T * self.timestep_hours,
-            total_cost=cost,
-        )
-
+    # --------------------------------------------------------
+    # Deadline extraction (unchanged)
+    # --------------------------------------------------------
     def _extract_deadlines(self, energy_forecasts: List[EnergyForecast]):
-        """Extract deadlines from energy forecasts."""
         deadlines = defaultdict(list)
-
         T = len(energy_forecasts)
         boats = energy_forecasts[0].boat_required_energy_kwh.keys()
 
@@ -210,8 +229,10 @@ class BaseOptimizer:
 
         return deadlines
 
+    # --------------------------------------------------------
+    # Save schedules (unchanged)
+    # --------------------------------------------------------
     def save_schedules_to_db(self, result: BaseOptimizationResult) -> None:
-        """Save schedules to database."""
         schedules = []
         power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
 
