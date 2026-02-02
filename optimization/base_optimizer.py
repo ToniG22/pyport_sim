@@ -45,8 +45,9 @@ class BaseOptimizer:
         T = len(energy_forecasts)
         timesteps = list(range(T))
         num_chargers = len(self.port.chargers)
+        num_boats = len(self.port.boats)
         print(
-            f"        {num_chargers} chargers, {T} timesteps, contracted_power={self.port.contracted_power} kW"
+            f"        {num_chargers} chargers, {num_boats} boats, {T} timesteps, contracted_power={self.port.contracted_power} kW"
         )
 
         model = Model("base_optimizer")
@@ -69,14 +70,6 @@ class BaseOptimizer:
                 name=f"grid_{t}", vtype="C", lb=0, ub=self.port.contracted_power
             )
 
-        # Per boat (source): max required energy over timesteps; sum those, then × 2
-        per_boat_kwh = {}
-        for t in timesteps:
-            for boat, kwh in energy_forecasts[t].boat_required_energy_kwh.items():
-                per_boat_kwh[boat] = max(per_boat_kwh.get(boat, 0), kwh)
-
-        print(f"Energy required: {per_boat_kwh}")
-
         # Deadlines
         deadlines = self._extract_deadlines(energy_forecasts)
         print(f"Deadlines: {deadlines}")
@@ -90,7 +83,7 @@ class BaseOptimizer:
                 else 0.0
             )
 
-        # PV usage variables (allows curtailment)
+        # PV usage
         pv_used = {}
         for t in timesteps:
             pv_used[t] = model.addVar(
