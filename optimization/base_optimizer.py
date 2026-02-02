@@ -104,17 +104,43 @@ class BaseOptimizer:
             if boat_name not in boats:
                 continue
 
-            for t_deadline, energy_required in boat_deadlines:
+            cumulative_energy = 0.0
+            for idx, (t_deadline, energy_required) in enumerate(boat_deadlines):
+                cumulative_energy += energy_required  # Accumulate energy for each trip
+
                 model.addCons(
                     quicksum(
                         p[c_idx][boat_name][t] * self.timestep_hours
                         for c_idx in range(num_chargers)
                         for t in range(t_deadline + 1)
                     )
-                    >= energy_required,
+                    >= cumulative_energy,
                     name=f"deadline_{boat_name}_{t_deadline}",
                 )
+                # DEBUG: Print what this constraint means
+                print(
+                    f"        DEBUG: {boat_name} deadline {idx}: sum(energy from t=0 to t={t_deadline}) >= {cumulative_energy:.2f} kWh"
+                )
 
+        # After the trip charging prevention constraints, add:
+        for boat_name, trips in trip_durations.items():
+            if boat_name not in boats:
+                continue
+
+            for trip_idx, (trip_start_t, duration) in enumerate(trips):
+                print(
+                    f"        DEBUG: {boat_name} trip {trip_idx}: no charging from t={trip_start_t} to t={trip_start_t + duration - 1} (duration={duration})"
+                )
+
+                for t in range(trip_start_t, trip_start_t + duration):
+                    if t < T:
+                        model.addCons(
+                            quicksum(
+                                p[c_idx][boat_name][t] for c_idx in range(num_chargers)
+                            )
+                            == 0,
+                            name=f"no_charge_trip_{boat_name}_{t}",
+                        )
         # ----------------------------------------------------
         # PV production
         # ----------------------------------------------------
