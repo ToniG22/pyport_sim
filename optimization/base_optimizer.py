@@ -97,6 +97,9 @@ class BaseOptimizer:
         deadlines = self._extract_deadlines(energy_forecasts)
         print(f"Deadlines: {deadlines}")
 
+        trip_durations = self._extract_trip_durations(energy_forecasts)
+        print(f"Trip durations: {trip_durations}")
+
         for boat_name, boat_deadlines in deadlines.items():
             if boat_name not in boats:
                 continue
@@ -228,6 +231,54 @@ class BaseOptimizer:
                     deadlines[boat].append((t, req_now))
 
         return deadlines
+
+    # --------------------------------------------------------
+    # Extract trip durations from forecast
+    # --------------------------------------------------------
+    def _extract_trip_durations(self, energy_forecasts: List[EnergyForecast]):
+        """
+        Extract trip start times and durations (in timesteps) from boat_available.
+
+        A trip is detected when boat_available changes from 1 -> 0.
+        The trip duration is the number of consecutive timesteps with value 0.
+
+        Returns:
+            Dict[str, List[Tuple[int, int]]]
+            {
+                boat_name: [
+                    (trip_start_t, duration_in_timesteps),
+                    ...
+                ]
+            }
+        """
+        trip_durations: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+
+        T = len(energy_forecasts)
+        boats = energy_forecasts[0].boat_available.keys()
+
+        for boat in boats:
+            t = 0
+            while t < T:
+                prev_available = (
+                    energy_forecasts[t - 1].boat_available.get(boat, 1) if t > 0 else 1
+                )
+                curr_available = energy_forecasts[t].boat_available.get(boat, 1)
+
+                if prev_available == 1 and curr_available == 0:
+                    start_t = t
+                    duration = 0
+
+                    while (
+                        t < T and energy_forecasts[t].boat_available.get(boat, 1) == 0
+                    ):
+                        duration += 1
+                        t += 1
+
+                    trip_durations[boat].append((start_t - 1, duration))
+                else:
+                    t += 1
+
+        return trip_durations
 
     # --------------------------------------------------------
     # Save schedules (unchanged)
