@@ -653,19 +653,37 @@ class SimulationEngine:
 
     def _assign_boats_to_chargers_with_schedule(self):
         """
-        Assign boats to chargers following the optimizer power schedule
-        for the current timestep.
+        Assign boats to chargers following the optimizer's BOAT-SPECIFIC power schedules.
+        
+        Each boat can only connect to ONE charger at a time (physical constraint).
+        The optimizer should output power values <= charger max power per boat.
+        
+        IMPORTANT: Updates self.boat_charger_map which _update_charging() uses.
         """
+        from models import BoatState, ChargerState  # Import at top of your file normally
 
         now = self.current_datetime
         ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
         # ------------------------------------------------------------------
-        # Load scheduled charger powers for THIS timestep
+        # Load scheduled BOAT powers for THIS timestep
         # ------------------------------------------------------------------
-        scheduled_power = {}  # charger_name -> power_kW
+        scheduled_boat_power = {}  # boat_name -> power_kW
         power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
 
+        for boat in self.port.boats:
+            src = self.db_manager.get_or_create_source(boat.name, "boat")
+            rows = self.db_manager.get_records(
+                table="scheduling",
+                source_id=src,
+                metric_id=power_setpoint_met,
+                start_time=ts_str,
+                end_time=ts_str,
+            )
+            scheduled_boat_power[boat.name] = float(rows[0]["value"]) if rows else 0.0
+
+        # Also load charger schedules for debugging
+        scheduled_charger_power = {}
         for charger in self.port.chargers:
             src = self.db_manager.get_or_create_source(charger.name, "charger")
             rows = self.db_manager.get_records(
@@ -675,10 +693,15 @@ class SimulationEngine:
                 start_time=ts_str,
                 end_time=ts_str,
             )
-            scheduled_power[charger.name] = float(rows[0]["value"]) if rows else 0.0
+            scheduled_charger_power[charger.name] = float(rows[0]["value"]) if rows else 0.0
+
+        # DEBUG: Print scheduled powers
+        if now.hour < 18 and now.minute % 15 == 0:
+            print(f"\n  [DEBUG {ts_str}] Scheduled boat powers: {scheduled_boat_power}")
+            print(f"  [DEBUG {ts_str}] Scheduled charger powers: {scheduled_charger_power}")
 
         # ------------------------------------------------------------------
-        # Build current charger ↔ boat mapping
+        # Build current charger ↔ boat mapping from charger state (one-to-one)
         # ------------------------------------------------------------------
         charger_to_boat = {}
         boat_to_charger = {}
@@ -687,18 +710,21 @@ class SimulationEngine:
             if charger.connected_boat:
                 charger_to_boat[charger.name] = charger.connected_boat
                 boat_to_charger[charger.connected_boat] = charger.name
-                self.boat_charger_map.setdefault(charger.connected_boat, charger.name)
 
-        # Remove stale mappings
-        for boat_name, charger_name in list(self.boat_charger_map.items()):
-            charger = next(
-                (c for c in self.port.chargers if c.name == charger_name), None
-            )
-            if not charger or charger.connected_boat != boat_name:
-                self.boat_charger_map.pop(boat_name, None)
+        # DEBUG: Print current assignments
+        if now.hour < 18 and now.minute % 15 == 0:
+            currently_charging = [
+                (
+                    boat_name,
+                    charger_name,
+                    next(b for b in self.port.boats if b.name == boat_name).soc,
+                )
+                for boat_name, charger_name in boat_to_charger.items()
+            ]
+            print(f"  [DEBUG] Currently charging: {currently_charging}")
 
         # ------------------------------------------------------------------
-        # FIX 1 — Force disconnect boats that are already fully charged
+        # Force disconnect boats that are already fully charged
         # ------------------------------------------------------------------
         for boat_name, charger_name in list(boat_to_charger.items()):
             boat = next(b for b in self.port.boats if b.name == boat_name)
@@ -706,100 +732,131 @@ class SimulationEngine:
             if boat.soc >= 0.99:
                 charger = next(c for c in self.port.chargers if c.name == charger_name)
 
+                if now.hour < 18 and now.minute % 15 == 0:
+                    print(f"  [DEBUG] Disconnecting {boat_name} - fully charged")
+
                 charger.state = ChargerState.IDLE
                 charger.power = 0.0
                 charger.connected_boat = None
-
                 boat.state = BoatState.IDLE
 
                 boat_to_charger.pop(boat_name, None)
                 charger_to_boat.pop(charger_name, None)
+                # CRITICAL: Also remove from self.boat_charger_map
                 self.boat_charger_map.pop(boat_name, None)
 
         # ------------------------------------------------------------------
-        # Helper: next trip time for sorting priority
+        # Process each boat according to its scheduled power
         # ------------------------------------------------------------------
-        def next_trip_time(boat):
-            trips = self.trip_manager.get_trips_for_date(
-                boat.name, self.current_datetime
-            )
-            if not trips:
-                return datetime.max
-            slot_idx = min(len(trips) - 1, len(self.trip_schedule) - 1)
-            if slot_idx < 0:
-                return datetime.max
-            start_hour = self.trip_schedule[slot_idx][0]
-            return self.current_datetime.replace(hour=start_hour, minute=0, second=0)
+        releases_made = []
+        assignments_made = []
 
-        # ------------------------------------------------------------------
-        # Sort boats by urgency (earliest trip, then lowest SOC)
-        # ------------------------------------------------------------------
-        boats_sorted = sorted(
-            self.port.boats,
-            key=lambda b: (next_trip_time(b), b.soc),
-        )
+        for boat in self.port.boats:
+            scheduled_power = scheduled_boat_power.get(boat.name, 0.0)
 
-        # ------------------------------------------------------------------
-        # Release chargers that should be OFF according to schedule
-        # ------------------------------------------------------------------
-        for charger in self.port.chargers:
-            p = scheduled_power.get(charger.name, 0.0)
-            if p <= 0.0 and charger.connected_boat:
-                boat_name = charger.connected_boat
-
-                charger.state = ChargerState.IDLE
-                charger.power = 0.0
-                charger.connected_boat = None
-
-                charger_to_boat.pop(charger.name, None)
-                boat_to_charger.pop(boat_name, None)
-                self.boat_charger_map.pop(boat_name, None)
-
-        # ------------------------------------------------------------------
-        # Assign chargers that should be ON
-        # ------------------------------------------------------------------
-        for boat in boats_sorted:
-            # 🚨 CRITICAL FIX: do NOT reconnect fully charged boats
-            if boat.state != BoatState.IDLE or boat.soc >= 0.99:
+            # Skip boats that are sailing
+            if boat.state == BoatState.SAILING:
                 continue
 
-            # Already charging → just update power
+            # Skip fully charged boats
+            if boat.soc >= 0.99:
+                continue
+
+            # ------------------------------------------------------------------
+            # Case 1: Boat should NOT be charging (scheduled power = 0)
+            # ------------------------------------------------------------------
+            if scheduled_power <= 0.01:
+                if boat.name in boat_to_charger:
+                    charger_name = boat_to_charger[boat.name]
+                    charger = next(c for c in self.port.chargers if c.name == charger_name)
+
+                    releases_made.append((boat.name, charger_name))
+
+                    charger.state = ChargerState.IDLE
+                    charger.power = 0.0
+                    charger.connected_boat = None
+                    boat.state = BoatState.IDLE
+
+                    boat_to_charger.pop(boat.name, None)
+                    charger_to_boat.pop(charger_name, None)
+                    # CRITICAL: Also remove from self.boat_charger_map
+                    self.boat_charger_map.pop(boat.name, None)
+                continue
+
+            # ------------------------------------------------------------------
+            # Case 2: Boat SHOULD be charging (scheduled power > 0)
+            # ------------------------------------------------------------------
             if boat.name in boat_to_charger:
+                # Already connected - just update power
                 charger_name = boat_to_charger[boat.name]
                 charger = next(c for c in self.port.chargers if c.name == charger_name)
 
-                charger.power = min(
-                    scheduled_power.get(charger.name, 0.0),
-                    charger.max_power,
-                )
+                old_power = charger.power
+                # Clamp to charger max power (should already be <= max from optimizer)
+                new_power = min(scheduled_power, charger.max_power)
+                charger.power = new_power
                 charger.state = ChargerState.CHARGING
-                continue
+                boat.state = BoatState.CHARGING
 
-            # Find free charger with scheduled power
-            free_charger = next(
-                (
-                    c
-                    for c in self.port.chargers
-                    if c.name not in charger_to_boat
-                    and scheduled_power.get(c.name, 0.0) > 0.0
-                ),
-                None,
+                if now.hour < 18 and now.minute % 15 == 0 and abs(old_power - new_power) > 0.1:
+                    print(f"  [DEBUG] Updated {boat.name} @ {charger.name}: {old_power:.1f}→{new_power:.1f} kW")
+            else:
+                # Need to find a free charger
+                # First, try to find an idle charger
+                free_charger = None
+                for c in self.port.chargers:
+                    if c.name not in charger_to_boat and c.state == ChargerState.IDLE:
+                        free_charger = c
+                        break
+
+                if not free_charger:
+                    # Try any unassigned charger
+                    for c in self.port.chargers:
+                        if c.name not in charger_to_boat:
+                            free_charger = c
+                            break
+
+                if free_charger:
+                    # Connect boat to charger
+                    new_power = min(scheduled_power, free_charger.max_power)
+
+                    free_charger.connected_boat = boat.name
+                    free_charger.state = ChargerState.CHARGING
+                    free_charger.power = new_power
+
+                    boat.state = BoatState.CHARGING
+
+                    charger_to_boat[free_charger.name] = boat.name
+                    boat_to_charger[boat.name] = free_charger.name
+                    # CRITICAL: Also add to self.boat_charger_map so _update_charging() works!
+                    self.boat_charger_map[boat.name] = free_charger.name
+
+                    assignments_made.append((boat.name, free_charger.name, new_power))
+                else:
+                    if now.hour < 18 and now.minute % 15 == 0:
+                        print(f"  [DEBUG] WARNING: No charger available for {boat.name} (needs {scheduled_power:.1f} kW)")
+
+        # DEBUG: Print releases and new assignments
+        if now.hour < 18 and now.minute % 15 == 0:
+            if releases_made:
+                print(f"  [DEBUG] Released: {releases_made}")
+            if assignments_made:
+                print(f"  [DEBUG] New assignments: {assignments_made}")
+
+        # DEBUG: Print final state
+        if now.hour < 18 and now.minute % 15 == 0:
+            total_power = sum(
+                c.power for c in self.port.chargers if c.state == ChargerState.CHARGING
             )
-
-            if not free_charger:
-                continue
-
-            # Connect boat
-            free_charger.connected_boat = boat.name
-            free_charger.state = ChargerState.CHARGING
-            free_charger.power = min(
-                scheduled_power.get(free_charger.name, 0.0),
-                free_charger.max_power,
+            active_chargers = [
+                (c.name, c.power, c.connected_boat)
+                for c in self.port.chargers
+                if c.state == ChargerState.CHARGING
+            ]
+            print(f"  [DEBUG] Active chargers: {active_chargers}")
+            print(
+                f"  [DEBUG] Total power: {total_power:.1f} kW / {self.port.contracted_power} kW contracted"
             )
-
-            charger_to_boat[free_charger.name] = boat.name
-            boat_to_charger[boat.name] = free_charger.name
-            self.boat_charger_map[boat.name] = free_charger.name
 
     def _override_schedules_for_shortfall_boat(self, boat_name: str, result):
         """
