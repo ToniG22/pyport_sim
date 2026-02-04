@@ -1,17 +1,12 @@
-"""Base optimizer v7: Clean implementation with proper multi-trip handling.
+"""Base optimizer v10: Maximize power usage during critical windows.
 
-The key insight: We need to model trips as EVENTS that consume energy at specific
-times, and ensure boats are charged sufficiently BEFORE each trip.
+Key insight from v8/v9 failure:
+- Optimizer was only using 44-66 kW when 80 kW was available
+- This wasted precious charging time in the critical 12:30-14:00 window
+- Result: All boats slightly undercharged instead of some fully charged
 
-Approach:
-1. For each trip, we have a "departure window" [deadline, cutoff]
-2. A binary variable indicates WHETHER the boat departs for each trip
-3. Another binary indicates AT WHICH TIMESTEP the boat departs
-4. SOC constraints ensure boat has enough energy at departure time
-5. Boat cannot charge while on trip (from departure to return)
-6. Trip energy is consumed at the return timestep
-
-This version uses a cleaner formulation that should solve faster.
+Solution: Add objective term that penalizes UNUSED contracted power when boats need charging.
+This forces the optimizer to use all available power during critical windows.
 """
 
 from collections import defaultdict
@@ -37,7 +32,7 @@ class BaseOptimizationResult:
 
 
 class BaseOptimizer:
-    """Minimize cost while maximizing trip completion."""
+    """Maximize power usage during critical charging windows."""
 
     def __init__(
         self, port: Port, db_manager: DatabaseManager, timestep_seconds: int = 900
@@ -52,7 +47,7 @@ class BaseOptimizer:
         forecast_date: datetime,
         energy_forecasts: List[EnergyForecast],
     ) -> BaseOptimizationResult:
-        print("     Running base optimization v7 (multi-trip with late departure)...")
+        print("     Running base optimization v10 (max power usage)...")
 
         T = len(energy_forecasts)
         timesteps = list(range(T))
@@ -73,61 +68,49 @@ class BaseOptimizer:
             b: next(boat for boat in self.port.boats if boat.name == b) for b in boats
         }
 
-        # Add safety margin to required energy to account for:
-        # 1. Differences between forecast and actual energy consumption
-        # 2. Charging efficiency losses
-        # 3. Speed variations during trips
-        # Using 15% margin based on observed ~10% discrepancy in testing
+        # Add 15% safety margin to energy requirements
         ENERGY_SAFETY_MARGIN = 1.15
         for b in deadlines:
             deadlines[b] = [
                 (t, energy * ENERGY_SAFETY_MARGIN) for t, energy in deadlines[b]
             ]
 
-        print(
-            f"        Deadlines (with {(ENERGY_SAFETY_MARGIN-1)*100:.0f}% safety margin): {dict(deadlines)}"
-        )
+        print(f"        Deadlines (with 15% margin): {dict(deadlines)}")
         print(f"        Trip durations: {dict(trip_durations)}")
 
-        # Cutoff hour for trips
-        cutoff_t = int(18 * 3600 / self.timestep_seconds)  # 18:00
+        for b in boats:
+            cap = boat_objects[b].battery_capacity
+            init_soc_kwh = boat_objects[b].soc * cap
+            print(
+                f"        {b}: Initial SOC = {init_soc_kwh:.1f} kWh ({boat_objects[b].soc:.1%})"
+            )
+
+        # Cutoff for late departures (18:00)
+        cutoff_t = int(18 * 3600 / self.timestep_seconds)
 
         # Create model
-        model = Model("optimizer_v7")
+        model = Model("optimizer_v10")
         model.hideOutput()
-        model.setRealParam("limits/time", 180.0)
+        model.setRealParam("limits/time", 120.0)
+        model.setRealParam("limits/gap", 0.03)
 
         # =====================================================
         # VARIABLES
         # =====================================================
 
-        # Charging power: p[c][b][t]
+        # Charging power per boat per timestep
+        max_boat_power = min(
+            22.0, self.port.contracted_power / num_boats * 2
+        )  # Allow flexibility
         p = {
-            c_idx: {
-                b: {
-                    t: model.addVar(
-                        f"p_{c_idx}_{b}_{t}",
-                        vtype="C",
-                        lb=0,
-                        ub=chargers[c_idx].max_power,
-                    )
-                    for t in timesteps
-                }
-                for b in boats
+            b: {
+                t: model.addVar(f"p_{b}_{t}", vtype="C", lb=0, ub=max_boat_power)
+                for t in timesteps
             }
-            for c_idx in range(num_chargers)
+            for b in boats
         }
 
-        # Charger assignment: y[c][b][t] = 1 if charger c serves boat b at t
-        y = {
-            c_idx: {
-                b: {t: model.addVar(f"y_{c_idx}_{b}_{t}", vtype="B") for t in timesteps}
-                for b in boats
-            }
-            for c_idx in range(num_chargers)
-        }
-
-        # SOC at end of timestep t
+        # SOC at end of timestep
         soc = {
             b: {
                 t: model.addVar(
@@ -144,99 +127,88 @@ class BaseOptimizer:
             for t in timesteps
         }
 
-        # PV used
-        pv_avail = [
-            (
-                energy_forecasts[t].power_active_production_kw
-                if self.port.pv_systems
-                else 0.0
+        # Unused power (slack variable to penalize)
+        unused_power = {
+            t: model.addVar(
+                f"unused_{t}", vtype="C", lb=0, ub=self.port.contracted_power
             )
-            for t in timesteps
-        ]
-        pv_used = {
-            t: model.addVar(f"pv_{t}", vtype="C", lb=0, ub=pv_avail[t])
             for t in timesteps
         }
 
-        # Trip variables
-        # depart_at[b][trip][t] = 1 if boat b departs for trip at timestep t
-        # at_port[b][t] = 1 if boat is at port (can charge) at timestep t
+        # Trip departure variables
         depart_at = {}
-        at_port = {}
-
         for b in boats:
             depart_at[b] = {}
-            at_port[b] = {
-                t: model.addVar(f"at_port_{b}_{t}", vtype="B") for t in timesteps
-            }
+            for trip_idx, (deadline_t, _) in enumerate(deadlines.get(b, [])):
+                depart_at[b][trip_idx] = {}
+                for t in range(deadline_t, cutoff_t):
+                    depart_at[b][trip_idx][t] = model.addVar(
+                        f"dep_{b}_{trip_idx}_{t}", vtype="B"
+                    )
 
-            for trip_idx in range(len(deadlines.get(b, []))):
-                depart_at[b][trip_idx] = {
-                    t: model.addVar(f"depart_{b}_{trip_idx}_{t}", vtype="B")
-                    for t in timesteps
-                }
+        # at_port[b][t] = 1 if boat can charge
+        at_port = {
+            b: {t: model.addVar(f"port_{b}_{t}", vtype="B") for t in timesteps}
+            for b in boats
+        }
+
+        # needs_charge[b][t] = 1 if boat is at port and not fully charged
+        needs_charge = {
+            b: {t: model.addVar(f"need_{b}_{t}", vtype="B") for t in timesteps}
+            for b in boats
+        }
 
         # =====================================================
         # CONSTRAINTS
         # =====================================================
 
-        # 1. Charger capacity
-        for c_idx in range(num_chargers):
-            for t in timesteps:
-                model.addCons(
-                    quicksum(p[c_idx][b][t] for b in boats)
-                    <= chargers[c_idx].max_power,
-                    f"charger_cap_{c_idx}_{t}",
-                )
-
-        # 2. One boat per charger
-        for c_idx in range(num_chargers):
-            for t in timesteps:
-                model.addCons(
-                    quicksum(y[c_idx][b][t] for b in boats) <= 1,
-                    f"one_boat_{c_idx}_{t}",
-                )
-
-        # 3. One charger per boat
-        for b in boats:
-            for t in timesteps:
-                model.addCons(
-                    quicksum(y[c_idx][b][t] for c_idx in range(num_chargers)) <= 1,
-                    f"one_charger_{b}_{t}",
-                )
-
-        # 4. Power linked to assignment
-        for c_idx in range(num_chargers):
-            for b in boats:
-                for t in timesteps:
-                    model.addCons(
-                        p[c_idx][b][t] <= chargers[c_idx].max_power * y[c_idx][b][t],
-                        f"link_{c_idx}_{b}_{t}",
-                    )
-
-        # 5. Power balance
+        # 1. Total power limit
         for t in timesteps:
-            total_charge = quicksum(
-                p[c_idx][b][t] for c_idx in range(num_chargers) for b in boats
+            model.addCons(
+                quicksum(p[b][t] for b in boats) <= self.port.contracted_power,
+                f"power_limit_{t}",
             )
-            model.addCons(grid_import[t] + pv_used[t] == total_charge, f"balance_{t}")
 
-        # 6. Initial SOC
+        # 2. Power balance with unused tracking
+        for t in timesteps:
+            total_charging = quicksum(p[b][t] for b in boats)
+            model.addCons(grid_import[t] == total_charging, f"balance_{t}")
+            # Unused power = contracted - actual used (when boats need charging)
+            model.addCons(
+                unused_power[t]
+                >= self.port.contracted_power
+                - total_charging
+                - self.port.contracted_power
+                * (1 - quicksum(needs_charge[b][t] for b in boats) / num_boats),
+                f"unused_{t}",
+            )
+
+        # 3. Initial SOC
         for b in boats:
             init_soc = boat_objects[b].soc * boat_objects[b].battery_capacity
             model.addCons(soc[b][0] == init_soc, f"init_soc_{b}")
-            print(
-                f"        {b}: Initial SOC = {init_soc:.1f} kWh ({boat_objects[b].soc:.1%})"
-            )
 
-        # 7. Can only charge when at port
+        # 4. Can only charge when at port
         for b in boats:
             for t in timesteps:
-                for c_idx in range(num_chargers):
-                    model.addCons(
-                        p[c_idx][b][t] <= chargers[c_idx].max_power * at_port[b][t],
-                        f"charge_at_port_{c_idx}_{b}_{t}",
-                    )
+                model.addCons(
+                    p[b][t] <= max_boat_power * at_port[b][t], f"at_port_charge_{b}_{t}"
+                )
+
+        # 5. needs_charge logic: at_port AND soc < capacity
+        for b in boats:
+            cap = boat_objects[b].battery_capacity
+            for t in timesteps:
+                # needs_charge <= at_port
+                model.addCons(needs_charge[b][t] <= at_port[b][t], f"need_port_{b}_{t}")
+                # needs_charge <= 1 if soc < cap (using big-M)
+                # If soc >= cap - epsilon, needs_charge should be 0
+                # soc >= cap - epsilon + M*(1 - needs_charge) would force needs_charge=0 when soc is high
+                # Simplified: just link needs_charge to at_port for now
+                model.addCons(
+                    needs_charge[b][t] >= at_port[b][t] - soc[b][t] / cap,
+                    f"need_soc_{b}_{t}",
+                )
 
         # =====================================================
         # TRIP LOGIC
@@ -250,48 +222,37 @@ class BaseOptimizer:
             for trip_idx, (deadline_t, required_energy) in enumerate(boat_trips):
                 _, duration = trip_durations[b][trip_idx]
 
-                # A. Departure only within [deadline, cutoff)
-                for t in timesteps:
-                    if t < deadline_t or t >= cutoff_t:
-                        model.addCons(
-                            depart_at[b][trip_idx][t] == 0,
-                            f"depart_window_{b}_{trip_idx}_{t}",
-                        )
-
-                # B. At most one departure per trip (0 or 1)
+                # A. Must depart exactly once
                 model.addCons(
-                    quicksum(depart_at[b][trip_idx][t] for t in timesteps) <= 1,
-                    f"at_most_one_depart_{b}_{trip_idx}",
+                    quicksum(
+                        depart_at[b][trip_idx][t] for t in range(deadline_t, cutoff_t)
+                    )
+                    == 1,
+                    f"one_depart_{b}_{trip_idx}",
                 )
 
-                # C. If departing at t, must have SOC >= required_energy at t
-                for t in range(deadline_t, min(cutoff_t, T)):
+                # B. SOC requirement at departure
+                for t in range(deadline_t, cutoff_t):
                     model.addCons(
                         soc[b][t]
                         >= required_energy - M * (1 - depart_at[b][trip_idx][t]),
-                        f"soc_for_trip_{b}_{trip_idx}_{t}",
+                        f"soc_req_{b}_{trip_idx}_{t}",
                     )
 
-                # D. If trip_idx > 0, can only depart after returning from previous trip
+                # C. Trip ordering
                 if trip_idx > 0:
                     prev_deadline, _ = boat_trips[trip_idx - 1]
                     _, prev_duration = trip_durations[b][trip_idx - 1]
 
-                    # Previous trip's return time depends on when it departed
-                    # For simplicity: trip trip_idx can only happen if we departed trip_idx-1
-                    # AND enough time has passed
-
-                    for t in range(deadline_t, min(cutoff_t, T)):
-                        # Sum of previous departures that would return by time t
-                        prev_returns_by_t = quicksum(
+                    for t in range(deadline_t, cutoff_t):
+                        prev_returned = quicksum(
                             depart_at[b][trip_idx - 1][t_prev]
-                            for t_prev in range(prev_deadline, min(cutoff_t, T))
-                            if t_prev + prev_duration
-                            < t  # Return at t_prev + duration, ready at t_prev + duration + 1
+                            for t_prev in range(prev_deadline, min(cutoff_t, t))
+                            if t_prev + prev_duration < t
                         )
                         model.addCons(
-                            depart_at[b][trip_idx][t] <= prev_returns_by_t,
-                            f"trip_order_{b}_{trip_idx}_{t}",
+                            depart_at[b][trip_idx][t] <= prev_returned,
+                            f"order_{b}_{trip_idx}_{t}",
                         )
 
         # =====================================================
@@ -302,34 +263,26 @@ class BaseOptimizer:
             boat_trips = deadlines.get(b, [])
 
             for t in timesteps:
-                # at_port[t] = 1 if NOT on any trip at time t
-                # on_trip at t means: exists trip_idx and t_dep such that
-                #   depart_at[trip_idx][t_dep] = 1 AND t_dep < t <= t_dep + duration
-
                 on_trip_indicators = []
+
                 for trip_idx, (deadline_t, _) in enumerate(boat_trips):
                     _, duration = trip_durations[b][trip_idx]
 
                     for t_dep in range(deadline_t, min(cutoff_t, T)):
-                        # If departed at t_dep, on trip during [t_dep+1, t_dep+duration]
                         if t_dep < t <= t_dep + duration:
                             on_trip_indicators.append(depart_at[b][trip_idx][t_dep])
 
                 if on_trip_indicators:
-                    # at_port[t] = 1 - any(on_trip_indicators)
-                    # at_port[t] <= 1 - each indicator
                     for ind in on_trip_indicators:
                         model.addCons(
-                            at_port[b][t] <= 1 - ind, f"not_on_trip_{b}_{t}_{id(ind)}"
+                            at_port[b][t] <= 1 - ind, f"not_trip_{b}_{t}_{id(ind)}"
                         )
-                    # at_port[t] >= 1 - sum(indicators)
                     model.addCons(
                         at_port[b][t] >= 1 - quicksum(on_trip_indicators),
-                        f"at_port_lb_{b}_{t}",
+                        f"port_lb_{b}_{t}",
                     )
                 else:
-                    # No trips could affect this timestep
-                    model.addCons(at_port[b][t] == 1, f"always_at_port_{b}_{t}")
+                    model.addCons(at_port[b][t] == 1, f"always_port_{b}_{t}")
 
         # =====================================================
         # SOC DYNAMICS
@@ -337,28 +290,21 @@ class BaseOptimizer:
 
         for b in boats:
             boat_trips = deadlines.get(b, [])
-            cap = boat_objects[b].battery_capacity
 
             for t in range(1, T):
-                charging = quicksum(p[c_idx][b][t - 1] for c_idx in range(num_chargers))
-                charge_energy = charging * efficiency * self.timestep_hours
+                charge_energy = p[b][t - 1] * efficiency * self.timestep_hours
 
-                # Energy consumed from trip returns at timestep t
-                # A trip returns at t if departure was at t - duration - 1
-                trip_energy_consumed = 0
+                # Energy consumed from trip returns
+                trip_energy = 0
                 for trip_idx, (deadline_t, required_energy) in enumerate(boat_trips):
                     _, duration = trip_durations[b][trip_idx]
-
-                    # Return happens at t_dep + duration + 1
-                    # So if return is at t, departure was at t - duration - 1
                     t_dep = t - duration - 1
+
                     if deadline_t <= t_dep < cutoff_t:
-                        trip_energy_consumed += (
-                            required_energy * depart_at[b][trip_idx][t_dep]
-                        )
+                        trip_energy += required_energy * depart_at[b][trip_idx][t_dep]
 
                 model.addCons(
-                    soc[b][t] == soc[b][t - 1] + charge_energy - trip_energy_consumed,
+                    soc[b][t] == soc[b][t - 1] + charge_energy - trip_energy,
                     f"soc_dyn_{b}_{t}",
                 )
 
@@ -366,41 +312,52 @@ class BaseOptimizer:
         # OBJECTIVE
         # =====================================================
 
-        # Tariff prices
+        # Get tariffs
         tariff = {}
         for t in timesteps:
             ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
             tariff[t] = self.port.get_tariff_price(ts)
 
-        # Energy cost
+        # 1. Energy cost (small weight)
         energy_cost = quicksum(
             grid_import[t] * tariff[t] * self.timestep_hours for t in timesteps
         )
 
-        # Late departure penalty
-        late_penalty = 200.0
-        late_cost = 0
+        # 2. Delay penalty - STRONGLY penalize NUMBER of delayed trips
+        # Key insight: We want 3 on-time + 2 very late >> 5 slightly late
+        # So the FIRST delay step is EXTREMELY expensive (50000)
+        # But subsequent steps are cheap (50 each)
+        # This makes: 2 boats delayed = 100,000 penalty
+        #             5 boats delayed = 250,000 penalty
+        # The optimizer will strongly prefer fewer delayed boats
+
+        FIRST_DELAY_PENALTY = 50000  # Huge penalty for being late AT ALL
+        INCREMENTAL_DELAY_PENALTY = 50  # Small penalty for each additional timestep
+
+        delay_penalty = 0
         for b in boats:
             for trip_idx, (deadline_t, _) in enumerate(deadlines.get(b, [])):
-                for t in range(deadline_t, min(cutoff_t, T)):
-                    lateness = t - deadline_t
-                    late_cost += late_penalty * lateness * depart_at[b][trip_idx][t]
+                for t in range(deadline_t + 1, cutoff_t):  # Only t > deadline
+                    delay_steps = t - deadline_t
+                    # First step costs 50000, each additional step costs 50
+                    penalty = (
+                        FIRST_DELAY_PENALTY
+                        + (delay_steps - 1) * INCREMENTAL_DELAY_PENALTY
+                    )
+                    delay_penalty += penalty * depart_at[b][trip_idx][t]
 
-        # Missed trip penalty (didn't depart at all)
-        missed_penalty = 50000.0
-        missed_cost = 0
-        for b in boats:
-            for trip_idx in range(len(deadlines.get(b, []))):
-                departed = quicksum(depart_at[b][trip_idx][t] for t in timesteps)
-                missed_cost += missed_penalty * (1 - departed)
+        # 3. Penalize unused power during critical windows
+        # This forces the optimizer to use all available power when boats need charging
+        # Higher penalty = stronger incentive to use full contracted power
+        unused_penalty = quicksum(unused_power[t] * 100 for t in timesteps)
 
-        model.setObjective(energy_cost + late_cost + missed_cost, "minimize")
+        model.setObjective(energy_cost + delay_penalty + unused_penalty, "minimize")
 
         # =====================================================
         # SOLVE
         # =====================================================
 
-        print("        Solving optimization problem...")
+        print("        Solving...")
         model.optimize()
         status = model.getStatus()
         print(f"        Status: {status}, Solutions: {model.getNSols()}")
@@ -412,30 +369,39 @@ class BaseOptimizer:
         # EXTRACT RESULTS
         # =====================================================
 
-        # Print trip results
         print("        Trip schedule:")
+        on_time = 0
+        late = 0
+
         for b in boats:
             for trip_idx, (deadline_t, req) in enumerate(deadlines.get(b, [])):
-                departed_t = None
-                for t in timesteps:
+                for t in range(deadline_t, cutoff_t):
                     if model.getVal(depart_at[b][trip_idx][t]) > 0.5:
-                        departed_t = t
+                        soc_val = model.getVal(soc[b][t])
+                        delay = t - deadline_t
+                        if delay == 0:
+                            print(
+                                f"          {b} trip {trip_idx+1}: ✓ ON TIME at t={t}, SOC={soc_val:.1f}kWh"
+                            )
+                            on_time += 1
+                        else:
+                            delay_min = delay * 15
+                            print(
+                                f"          {b} trip {trip_idx+1}: LATE by {delay_min}min (t={t}), SOC={soc_val:.1f}kWh"
+                            )
+                            late += 1
                         break
 
-                if departed_t is not None:
-                    delay = departed_t - deadline_t
-                    delay_min = delay * self.timestep_hours * 60
-                    soc_at_dep = model.getVal(soc[b][departed_t])
-                    if delay == 0:
-                        print(
-                            f"          {b} trip {trip_idx+1}: ON TIME at t={departed_t}, SOC={soc_at_dep:.1f}kWh"
-                        )
-                    else:
-                        print(
-                            f"          {b} trip {trip_idx+1}: LATE by {delay_min:.0f}min (t={departed_t}), SOC={soc_at_dep:.1f}kWh"
-                        )
-                else:
-                    print(f"          {b} trip {trip_idx+1}: CANCELLED")
+        print(f"        Summary: {on_time} on-time, {late} late")
+
+        # Debug: Show power usage in critical window
+        print("        Power usage in critical window (12:30-14:00):")
+        for t in range(50, 56):  # t=50 is 12:30, t=55 is 13:45
+            total_p = sum(model.getVal(p[b][t]) for b in boats)
+            ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+            print(
+                f"          {ts.strftime('%H:%M')}: {total_p:.1f} kW / {self.port.contracted_power} kW"
+            )
 
         # Build schedules
         charger_schedules = {c.name: [] for c in chargers}
@@ -447,35 +413,34 @@ class BaseOptimizer:
         for t in timesteps:
             ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
 
-            power_t = 0.0
-            for c_idx, charger in enumerate(chargers):
-                pc = sum(max(0, model.getVal(p[c_idx][b][t])) for b in boats)
-                charger_schedules[charger.name].append((ts, pc))
-                power_t += pc
+            boat_powers = {b: max(0, model.getVal(p[b][t])) for b in boats}
+
+            # Simple charger assignment
+            charger_power = {c.name: 0.0 for c in chargers}
+            charger_idx = 0
+            for b in boats:
+                if boat_powers[b] > 0.1:
+                    charger_power[
+                        chargers[charger_idx % num_chargers].name
+                    ] += boat_powers[b]
+                    charger_idx += 1
+
+            for c in chargers:
+                charger_schedules[c.name].append((ts, charger_power[c.name]))
 
             for b in boats:
-                bp = sum(
-                    max(0, model.getVal(p[c_idx][b][t]))
-                    for c_idx in range(num_chargers)
-                )
-                boat_schedules[b].append((ts, bp))
+                boat_schedules[b].append((ts, boat_powers[b]))
 
-            peak_power = max(peak_power, power_t)
-            total_energy += power_t * self.timestep_hours
+            total_power = sum(boat_powers.values())
+            peak_power = max(peak_power, total_power)
+            total_energy += total_power * self.timestep_hours
             total_cost_val += (
-                max(0, model.getVal(grid_import[t])) * tariff[t] * self.timestep_hours
+                model.getVal(grid_import[t]) * tariff[t] * self.timestep_hours
             )
 
         print(
             f"     Complete: Peak={peak_power:.1f}kW, Energy={total_energy:.1f}kWh, Cost=€{total_cost_val:.2f}"
         )
-
-        # Print charging summary
-        print("        Charging summary:")
-        for b in boats:
-            total_kwh = sum(pw * self.timestep_hours for _, pw in boat_schedules[b])
-            num_steps = sum(1 for _, pw in boat_schedules[b] if pw > 0.1)
-            print(f"          {b}: {total_kwh:.1f} kWh over {num_steps} timesteps")
 
         return BaseOptimizationResult(
             status=status,
