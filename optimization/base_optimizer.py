@@ -56,7 +56,9 @@ class BaseOptimizer:
 
         num_chargers = len(chargers)
         num_boats = len(boats)
-        efficiency = 0.95
+        # Per-charger efficiency (power delivered to boat = grid power * efficiency)
+        charger_efficiency = [c.efficiency for c in chargers]
+        charger_max_power = [c.max_power for c in chargers]
 
         print(f"        {num_chargers} chargers, {num_boats} boats, {T} timesteps")
         print(f"        Contracted power: {self.port.contracted_power} kW")
@@ -98,14 +100,33 @@ class BaseOptimizer:
         # VARIABLES
         # =====================================================
 
-        # Charging power per boat per timestep
+        # Charging power: boat b from charger c at timestep t (grid-side power)
         max_boat_power = min(
             22.0, self.port.contracted_power / num_boats * 2
         )  # Allow flexibility
         p = {
             b: {
-                t: model.addVar(f"p_{b}_{t}", vtype="C", lb=0, ub=max_boat_power)
-                for t in timesteps
+                c: {
+                    t: model.addVar(
+                        f"p_{b}_{c}_{t}",
+                        vtype="C",
+                        lb=0,
+                        ub=min(max_boat_power, charger_max_power[c]),
+                    )
+                    for t in timesteps
+                }
+                for c in range(num_chargers)
+            }
+            for b in boats
+        }
+        # Assignment: boat b at charger c at t (at most one charger per boat per t)
+        x = {
+            b: {
+                c: {
+                    t: model.addVar(f"x_{b}_{c}_{t}", vtype="B")
+                    for t in timesteps
+                }
+                for c in range(num_chargers)
             }
             for b in boats
         }
@@ -165,13 +186,18 @@ class BaseOptimizer:
         # 1. Total power limit
         for t in timesteps:
             model.addCons(
-                quicksum(p[b][t] for b in boats) <= self.port.contracted_power,
+                quicksum(
+                    p[b][c][t] for b in boats for c in range(num_chargers)
+                )
+                <= self.port.contracted_power,
                 f"power_limit_{t}",
             )
 
         # 2. Power balance with unused tracking
         for t in timesteps:
-            total_charging = quicksum(p[b][t] for b in boats)
+            total_charging = quicksum(
+                p[b][c][t] for b in boats for c in range(num_chargers)
+            )
             model.addCons(grid_import[t] == total_charging, f"balance_{t}")
             # Unused power = contracted - actual used (when boats need charging)
             model.addCons(
@@ -188,11 +214,34 @@ class BaseOptimizer:
             init_soc = boat_objects[b].soc * boat_objects[b].battery_capacity
             model.addCons(soc[b][0] == init_soc, f"init_soc_{b}")
 
-        # 4. Can only charge when at port
+        # 4. Boat–charger assignment: at most one charger per boat per t; only when at port
         for b in boats:
             for t in timesteps:
                 model.addCons(
-                    p[b][t] <= max_boat_power * at_port[b][t], f"at_port_charge_{b}_{t}"
+                    quicksum(x[b][c][t] for c in range(num_chargers)) == at_port[b][t],
+                    f"one_charger_{b}_{t}",
+                )
+        for b in boats:
+            for c in range(num_chargers):
+                for t in timesteps:
+                    model.addCons(
+                        p[b][c][t]
+                        <= min(max_boat_power, charger_max_power[c]) * x[b][c][t],
+                        f"assign_power_{b}_{c}_{t}",
+                    )
+        # Each charger at most one boat at a time
+        for c in range(num_chargers):
+            for t in timesteps:
+                model.addCons(
+                    quicksum(x[b][c][t] for b in boats) <= 1,
+                    f"one_boat_per_charger_{c}_{t}",
+                )
+        # Charger power limit
+        for c in range(num_chargers):
+            for t in timesteps:
+                model.addCons(
+                    quicksum(p[b][c][t] for b in boats) <= charger_max_power[c],
+                    f"charger_max_{c}_{t}",
                 )
 
         # 5. needs_charge logic: at_port AND soc < capacity
@@ -292,7 +341,11 @@ class BaseOptimizer:
             boat_trips = deadlines.get(b, [])
 
             for t in range(1, T):
-                charge_energy = p[b][t - 1] * efficiency * self.timestep_hours
+                # Delivered energy to boat = sum over chargers of (grid power * charger efficiency)
+                charge_energy = quicksum(
+                    p[b][c][t - 1] * charger_efficiency[c]
+                    for c in range(num_chargers)
+                ) * self.timestep_hours
 
                 # Energy consumed from trip returns
                 trip_energy = 0
@@ -397,13 +450,17 @@ class BaseOptimizer:
         # Debug: Show power usage in critical window
         print("        Power usage in critical window (12:30-14:00):")
         for t in range(50, 56):  # t=50 is 12:30, t=55 is 13:45
-            total_p = sum(model.getVal(p[b][t]) for b in boats)
+            total_p = sum(
+                model.getVal(p[b][c][t])
+                for b in boats
+                for c in range(num_chargers)
+            )
             ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
             print(
                 f"          {ts.strftime('%H:%M')}: {total_p:.1f} kW / {self.port.contracted_power} kW"
             )
 
-        # Build schedules
+        # Build schedules from charger–boat assignment
         charger_schedules = {c.name: [] for c in chargers}
         boat_schedules = {b: [] for b in boats}
         peak_power = 0.0
@@ -413,17 +470,22 @@ class BaseOptimizer:
         for t in timesteps:
             ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
 
-            boat_powers = {b: max(0, model.getVal(p[b][t])) for b in boats}
-
-            # Simple charger assignment
-            charger_power = {c.name: 0.0 for c in chargers}
-            charger_idx = 0
-            for b in boats:
-                if boat_powers[b] > 0.1:
-                    charger_power[
-                        chargers[charger_idx % num_chargers].name
-                    ] += boat_powers[b]
-                    charger_idx += 1
+            # Power per boat (grid-side, from assigned charger)
+            boat_powers = {
+                b: max(
+                    0,
+                    sum(model.getVal(p[b][c][t]) for c in range(num_chargers)),
+                )
+                for b in boats
+            }
+            # Power per charger (grid-side)
+            charger_power = {
+                chargers[c].name: max(
+                    0,
+                    sum(model.getVal(p[b][c][t]) for b in boats),
+                )
+                for c in range(num_chargers)
+            }
 
             for c in chargers:
                 charger_schedules[c.name].append((ts, charger_power[c.name]))
@@ -431,7 +493,11 @@ class BaseOptimizer:
             for b in boats:
                 boat_schedules[b].append((ts, boat_powers[b]))
 
-            total_power = sum(boat_powers.values())
+            total_power = sum(
+                model.getVal(p[b][c][t])
+                for b in boats
+                for c in range(num_chargers)
+            )
             peak_power = max(peak_power, total_power)
             total_energy += total_power * self.timestep_hours
             total_cost_val += (
