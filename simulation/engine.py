@@ -92,9 +92,30 @@ class SimulationEngine:
         # Initialize optimizer (if enabled)
         self.optimizer = None
         self.use_optimizer = settings.use_optimizer
+        # Pre-assign boats to chargers 1:1 (required when optimizer is enabled)
+        self.boat_charger_assignments = {}  # {boat_name: charger_index}
         if self.use_optimizer:
-            self.optimizer = BaseOptimizer(port, db_manager, settings.timestep)
-            print("\n🔧 Optimizer enabled (base - contracted power constraint only)")
+            num_boats = len(self.port.boats)
+            num_chargers = len(self.port.chargers)
+            if num_boats != num_chargers:
+                raise ValueError(
+                    f"Optimizer requires n_boats == n_chargers, "
+                    f"got {num_boats} boats and {num_chargers} chargers"
+                )
+            # Fixed 1:1 mapping: boat i -> charger i
+            for i, boat in enumerate(self.port.boats):
+                self.boat_charger_assignments[boat.name] = i
+            self.optimizer = BaseOptimizer(
+                port,
+                db_manager,
+                settings.timestep,
+                self.boat_charger_assignments,
+                settings.trip_schedule,
+            )
+
+            print(
+                f"   Pre-assignments: {', '.join(f'{b} → {self.port.chargers[c].name}' for b, c in self.boat_charger_assignments.items())}"
+            )
 
         # Store latest forecasts for optimizer
         self.latest_energy_forecasts = []
@@ -294,77 +315,10 @@ class SimulationEngine:
             self.current_datetime, self.latest_energy_forecasts
         )
 
-        # For reliability optimizer, track boats with issues
-        if hasattr(result, "boats_cancelled"):
-            self.boats_with_shortfalls = set(
-                result.boats_cancelled + result.boats_delayed
-            )
-
         # Save schedules to database
         self.optimizer.save_schedules_to_db(result)
 
         print(f"     ✓ Schedules saved to database")
-
-    def _trigger_reoptimization(self):
-        """Trigger re-optimization when boat state changes (arrive/depart)."""
-        if self.settings.mode == SimulationMode.BATCH:
-            return
-
-        current_date_str = self.current_datetime.strftime("%Y-%m-%d")
-
-        # Only re-optimize during daytime (after 6:00, before 20:00)
-        if self.current_datetime.hour < 6 or self.current_datetime.hour >= 20:
-            return
-
-        print(f"  🔄 Re-optimizing from {self.current_datetime.strftime('%H:%M')}...")
-
-        # Clear existing schedules for remaining day only (from current time onwards)
-        # This preserves schedules for the early part of the day
-        current_time_str = self.current_datetime.strftime("%Y-%m-%d %H:%M:%S")
-        for charger in self.port.chargers:
-            # Clear only schedules from current time onwards
-            charger_src = self.db_manager.get_or_create_source(charger.name, "charger")
-            self.db_manager.clear_records(
-                "scheduling", source_id=charger_src, from_time=current_time_str
-            )
-        for bess in self.port.bess_systems:
-            bess_src = self.db_manager.get_or_create_source(bess.name, "bess")
-            self.db_manager.clear_records(
-                "scheduling", source_id=bess_src, from_time=current_time_str
-            )
-
-        # Get trip assignments for today (remaining trips)
-        trip_assignments = {}
-        for boat in self.port.boats:
-            trips = self.trip_manager.get_trips_for_date(
-                boat.name, self.current_datetime
-            )
-            trip_assignments[boat.name] = trips
-
-        # Generate forecast from current time to end of day
-        remaining_forecasts = [
-            f
-            for f in self.latest_energy_forecasts
-            if f.timestamp >= self.current_datetime
-        ]
-
-        if remaining_forecasts:
-            # Run optimization with updated boat SOCs
-            result = self.optimizer.optimize_daily_schedule(
-                self.current_datetime, remaining_forecasts
-            )
-
-            # For reliability optimizer, track boats with issues
-            if hasattr(result, "boats_cancelled"):
-                self.boats_with_shortfalls = set(
-                    result.boats_cancelled + result.boats_delayed
-                )
-
-            # Save new schedules
-            self.optimizer.save_schedules_to_db(result)
-            print(
-                f"     ✓ Updated schedules from {self.current_datetime.strftime('%H:%M')} onwards"
-            )
 
     def _handle_energy_shortfalls(self, result, trip_assignments: Dict[str, List]):
         """
@@ -483,9 +437,6 @@ class SimulationEngine:
                     )
                     del self.active_trips[boat_name]
 
-                    # Trigger re-optimization if optimizer is enabled
-                    if self.use_optimizer and self.optimizer:
-                        self._trigger_reoptimization()
                 else:
                     # Still on trip, discharge battery based on current speed from CSV
                     self._discharge_boat_on_trip(boat, trip, elapsed)
@@ -536,10 +487,6 @@ class SimulationEngine:
                         f"SOC={boat.soc:.1%} (needed {required_soc:.1%})"
                     )
                     del self.delayed_trips[boat_name]
-
-                    # Trigger re-optimization if optimizer is enabled
-                    if self.use_optimizer and self.optimizer:
-                        self._trigger_reoptimization()
                 continue
 
             # Check if it's time to start a new trip
@@ -584,10 +531,6 @@ class SimulationEngine:
                             f"  → {boat.name} starting {trip.route_name} at {self.current_datetime.strftime('%H:%M')}, "
                             f"SOC={boat.soc:.1%} (need {required_soc:.1%})"
                         )
-
-                        # Trigger re-optimization if optimizer is enabled
-                        if self.use_optimizer and self.optimizer:
-                            self._trigger_reoptimization()
 
                         break
                     else:
@@ -654,13 +597,16 @@ class SimulationEngine:
     def _assign_boats_to_chargers_with_schedule(self):
         """
         Assign boats to chargers following the optimizer's BOAT-SPECIFIC power schedules.
-        
+
         Each boat can only connect to ONE charger at a time (physical constraint).
         The optimizer should output power values <= charger max power per boat.
-        
+
         IMPORTANT: Updates self.boat_charger_map which _update_charging() uses.
         """
-        from models import BoatState, ChargerState  # Import at top of your file normally
+        from models import (
+            BoatState,
+            ChargerState,
+        )  # Import at top of your file normally
 
         now = self.current_datetime
         ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -693,12 +639,16 @@ class SimulationEngine:
                 start_time=ts_str,
                 end_time=ts_str,
             )
-            scheduled_charger_power[charger.name] = float(rows[0]["value"]) if rows else 0.0
+            scheduled_charger_power[charger.name] = (
+                float(rows[0]["value"]) if rows else 0.0
+            )
 
         # DEBUG: Print scheduled powers
         if now.hour < 18 and now.minute % 15 == 0:
             print(f"\n  [DEBUG {ts_str}] Scheduled boat powers: {scheduled_boat_power}")
-            print(f"  [DEBUG {ts_str}] Scheduled charger powers: {scheduled_charger_power}")
+            print(
+                f"  [DEBUG {ts_str}] Scheduled charger powers: {scheduled_charger_power}"
+            )
 
         # ------------------------------------------------------------------
         # Build current charger ↔ boat mapping from charger state (one-to-one)
@@ -768,7 +718,9 @@ class SimulationEngine:
             if scheduled_power <= 0.01:
                 if boat.name in boat_to_charger:
                     charger_name = boat_to_charger[boat.name]
-                    charger = next(c for c in self.port.chargers if c.name == charger_name)
+                    charger = next(
+                        c for c in self.port.chargers if c.name == charger_name
+                    )
 
                     releases_made.append((boat.name, charger_name))
 
@@ -798,43 +750,42 @@ class SimulationEngine:
                 charger.state = ChargerState.CHARGING
                 boat.state = BoatState.CHARGING
 
-                if now.hour < 18 and now.minute % 15 == 0 and abs(old_power - new_power) > 0.1:
-                    print(f"  [DEBUG] Updated {boat.name} @ {charger.name}: {old_power:.1f}→{new_power:.1f} kW")
+                if (
+                    now.hour < 18
+                    and now.minute % 15 == 0
+                    and abs(old_power - new_power) > 0.1
+                ):
+                    print(
+                        f"  [DEBUG] Updated {boat.name} @ {charger.name}: {old_power:.1f}→{new_power:.1f} kW"
+                    )
             else:
-                # Need to find a free charger
-                # First, try to find an idle charger
-                free_charger = None
-                for c in self.port.chargers:
-                    if c.name not in charger_to_boat and c.state == ChargerState.IDLE:
-                        free_charger = c
-                        break
+                # Use pre-assigned charger (1:1 mapping)
+                assigned_idx = self.boat_charger_assignments.get(boat.name)
+                if assigned_idx is not None:
+                    assigned_charger = self.port.chargers[assigned_idx]
 
-                if not free_charger:
-                    # Try any unassigned charger
-                    for c in self.port.chargers:
-                        if c.name not in charger_to_boat:
-                            free_charger = c
-                            break
+                    # Connect boat to its pre-assigned charger
+                    new_power = min(scheduled_power, assigned_charger.max_power)
 
-                if free_charger:
-                    # Connect boat to charger
-                    new_power = min(scheduled_power, free_charger.max_power)
-
-                    free_charger.connected_boat = boat.name
-                    free_charger.state = ChargerState.CHARGING
-                    free_charger.power = new_power
+                    assigned_charger.connected_boat = boat.name
+                    assigned_charger.state = ChargerState.CHARGING
+                    assigned_charger.power = new_power
 
                     boat.state = BoatState.CHARGING
 
-                    charger_to_boat[free_charger.name] = boat.name
-                    boat_to_charger[boat.name] = free_charger.name
+                    charger_to_boat[assigned_charger.name] = boat.name
+                    boat_to_charger[boat.name] = assigned_charger.name
                     # CRITICAL: Also add to self.boat_charger_map so _update_charging() works!
-                    self.boat_charger_map[boat.name] = free_charger.name
+                    self.boat_charger_map[boat.name] = assigned_charger.name
 
-                    assignments_made.append((boat.name, free_charger.name, new_power))
+                    assignments_made.append(
+                        (boat.name, assigned_charger.name, new_power)
+                    )
                 else:
                     if now.hour < 18 and now.minute % 15 == 0:
-                        print(f"  [DEBUG] WARNING: No charger available for {boat.name} (needs {scheduled_power:.1f} kW)")
+                        print(
+                            f"  [DEBUG] WARNING: No pre-assignment for {boat.name} (needs {scheduled_power:.1f} kW)"
+                        )
 
         # DEBUG: Print releases and new assignments
         if now.hour < 18 and now.minute % 15 == 0:
