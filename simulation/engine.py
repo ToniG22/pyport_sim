@@ -2,15 +2,15 @@
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Union
+from typing import Dict, List, Optional, Union
 
-from models import Port, BoatState, ChargerState, Trip
-from database import DatabaseManager
 from config import Settings, SimulationMode
+from database import DatabaseManager
+from forecasting import PortForecaster
+from models import BoatState, ChargerState, Port, Trip
+from optimization import BaseOptimizer
 from simulation.trip_manager import TripManager
 from weather import OpenMeteoClient
-from forecasting import PortForecaster
-from optimization import BaseOptimizer
 
 
 class SimulationEngine:
@@ -603,7 +603,6 @@ class SimulationEngine:
 
         IMPORTANT: Updates self.boat_charger_map which _update_charging() uses.
         """
-        from models import BoatState, ChargerState
 
         now = self.current_datetime
         ts_str = now.strftime("%Y-%m-%d %H:%M:%S")

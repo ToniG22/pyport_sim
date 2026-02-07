@@ -53,12 +53,10 @@ class BaseOptimizer:
         model.hideOutput()
 
         # --------------------------------------------------
-        # PLACEHOLDER TRIPS (per boat)
+        # Extract trip events per boat from forecasts
         # --------------------------------------------------
-        TRIPS = [
-            {"t": 35, "energy": 64.0},  # trip 1
-            {"t": 55, "energy": 64.0},  # trip 2
-        ]
+        trip_events = self._extract_trip_events(energy_forecasts)
+        print("TRIP EVENTS", trip_events)
 
         # --------------------------------------------------
         # Grid import
@@ -99,12 +97,13 @@ class BaseOptimizer:
         }
 
         # --------------------------------------------------
-        # Trip decision binaries
+        # Trip decision binaries (per boat, using its own trips)
         # --------------------------------------------------
         go_trip = {}  # go_trip[(boat, trip_idx)]
 
         for boat in self.boat_charger_assignments:
-            for i in range(len(TRIPS)):
+            boat_trips = trip_events.get(boat, [])
+            for i in range(len(boat_trips)):
                 go_trip[(boat, i)] = model.addVar(
                     vtype="B", name=f"go_{boat}_trip{i+1}"
                 )
@@ -112,17 +111,18 @@ class BaseOptimizer:
         BIG_M = 1e4  # kWh, safely large
 
         # --------------------------------------------------
-        # Trip energy constraints (cumulative)
+        # Trip energy constraints (cumulative, per boat)
         # --------------------------------------------------
         for charger in self.port.chargers:
             charger_name = charger.name
             boat = charger_to_boat[charger_name]
+            boat_trips = trip_events.get(boat, [])
 
             cumulative_energy = 0.0
 
-            for i, trip in enumerate(TRIPS):
-                cumulative_energy += trip["energy"]
-                t_dep = trip["t"]
+            for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
+                cumulative_energy += energy_req
+                t_dep = t_deadline  # charge must be done by this timestep
 
                 model.addCons(
                     quicksum(
@@ -168,7 +168,7 @@ class BaseOptimizer:
             raise RuntimeError(f"SCIP failed ({status})")
 
         # --------------------------------------------------
-        # Extract schedules (unchanged from your code)
+        # Extract schedules
         # --------------------------------------------------
         charger_schedules = {c.name: [] for c in self.port.chargers}
         peak_power = 0.0
@@ -201,6 +201,53 @@ class BaseOptimizer:
             total_energy_kwh=total_energy,
             total_cost=total_cost_val,
         )
+
+    def _extract_trip_events(self, energy_forecasts):
+        """
+        Extract trip events per boat.
+
+        Returns:
+            Dict[boat, List[(t_deadline, energy_required, duration)]]
+        """
+        trips = defaultdict(list)
+        T = len(energy_forecasts)
+
+        for boat in self.port.boats:
+            t = 0
+            while t < T:
+                prev_avail = (
+                    energy_forecasts[t - 1].boat_available.get(boat.name, 1)
+                    if t > 0
+                    else 1
+                )
+                curr_avail = energy_forecasts[t].boat_available.get(boat.name, 1)
+
+                # Trip starts here
+                if prev_avail == 1 and curr_avail == 0:
+                    start_t = t
+
+                    # Trip duration
+                    dur = 0
+                    while (
+                        t < T
+                        and energy_forecasts[t].boat_available.get(boat.name, 1) == 0
+                    ):
+                        dur += 1
+                        t += 1
+
+                    # Deadline is timestep BEFORE departure
+                    deadline_t = start_t - 1
+
+                    # Energy requirement at deadline
+                    energy_req = energy_forecasts[
+                        deadline_t
+                    ].boat_required_energy_kwh.get(boat.name, 0.0)
+
+                    trips[boat.name].append((deadline_t, energy_req, dur))
+                else:
+                    t += 1
+
+        return trips
 
     def save_schedules_to_db(self, result: BaseOptimizationResult) -> None:
         """Save schedules to database."""
