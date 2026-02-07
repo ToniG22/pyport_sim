@@ -141,12 +141,14 @@ class BaseOptimizer:
         # --------------------------------------------------
         soc = {}
         boat_objects = {b.name: b for b in self.port.boats}
+        charger_objects = {c.name: c for c in self.port.chargers}
 
         for charger in self.port.chargers:
             charger_name = charger.name
             boat = charger_to_boat[charger_name]
             battery_cap = boat_objects[boat].battery_capacity
             initial_soc_kwh = boat_objects[boat].soc * battery_cap
+            charger_eff = charger_objects[charger_name].efficiency
 
             soc[boat] = {
                 t: model.addVar(lb=0, ub=battery_cap, name=f"soc_{boat}_{t}")
@@ -166,7 +168,10 @@ class BaseOptimizer:
 
                 # --- SOC dynamics ---
                 soc_prev = soc[boat][t - 1] if t > 0 else initial_soc_kwh
-                charge_energy = charger_power[charger_name][t] * self.timestep_hours
+                # Apply charger efficiency: battery receives power × η
+                charge_energy = (
+                    charger_power[charger_name][t] * charger_eff * self.timestep_hours
+                )
 
                 # Energy deducted when returning from a trip
                 trip_drain = ret_e.get(t, 0.0)
@@ -181,6 +186,7 @@ class BaseOptimizer:
         # --------------------------------------------------
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
+
             for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
                 model.addCons(
                     soc[boat][t_deadline]
@@ -201,6 +207,29 @@ class BaseOptimizer:
                 )
 
         # --------------------------------------------------
+        # Symmetry breaking: enforce ordering among boats
+        # --------------------------------------------------
+        # With identical boats, the optimizer can spread power
+        # equally and no single boat reaches the threshold.
+        # Force: go_trip[(boat_k, i)] <= go_trip[(boat_k-1, i)]
+        # so boat_0 goes before boat_1, boat_1 before boat_2, etc.
+        # --------------------------------------------------
+        boat_list = list(self.boat_charger_assignments.keys())
+        max_trips_per_boat = max(
+            (len(trip_events.get(b, [])) for b in boat_list), default=0
+        )
+
+        for i in range(max_trips_per_boat):
+            for k in range(1, len(boat_list)):
+                b_prev = boat_list[k - 1]
+                b_curr = boat_list[k]
+                if (b_prev, i) in go_trip and (b_curr, i) in go_trip:
+                    model.addCons(
+                        go_trip[(b_curr, i)] <= go_trip[(b_prev, i)],
+                        name=f"sym_{b_curr}_trip{i+1}",
+                    )
+
+        # --------------------------------------------------
         # Tariffs
         # --------------------------------------------------
         tariff_price = {
@@ -215,12 +244,23 @@ class BaseOptimizer:
         )
 
         # --------------------------------------------------
-        # Objective: maximize trips, then minimize cost
+        # Objective: maximize trips (with priority), minimize cost
         # --------------------------------------------------
-        trip_reward = quicksum(go_trip.values())
+        # Each go_trip gets a large reward so the optimizer
+        # maximizes the total number of trips completed.
+        # A small decreasing bonus per boat index breaks ties
+        # and encourages concentrating on fewer boats first.
+        # --------------------------------------------------
+        n_boats = len(boat_list)
+        trip_reward = quicksum(
+            (1000 + (n_boats - k) * 0.1) * go_trip[(boat_list[k], i)]
+            for i in range(max_trips_per_boat)
+            for k in range(n_boats)
+            if (boat_list[k], i) in go_trip
+        )
 
         model.setObjective(
-            -1000 * trip_reward + energy_cost,  # lexicographic via scaling
+            -trip_reward + energy_cost,
             "minimize",
         )
 
