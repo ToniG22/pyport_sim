@@ -111,27 +111,93 @@ class BaseOptimizer:
         BIG_M = 1e4  # kWh, safely large
 
         # --------------------------------------------------
-        # Trip energy constraints (cumulative, per boat)
+        # Build per-boat trip lookup structures
         # --------------------------------------------------
+        # away_timesteps[boat]: set of timesteps when boat is at sea
+        # return_energy[boat][t]: energy consumed by the trip that
+        #   ends just before timestep t (deducted when boat returns)
+        # --------------------------------------------------
+        away_timesteps = {}
+        return_energy = {}
+
+        for boat in self.boat_charger_assignments:
+            away_ts = set()
+            ret_energy = {}
+            for t_deadline, energy_req, dur in trip_events.get(boat, []):
+                t_depart = t_deadline + 1
+                t_return = t_depart + dur  # first timestep back at port
+                for t in range(t_depart, min(t_return, T)):
+                    away_ts.add(t)
+                # Deduct trip energy at the return timestep
+                if t_return < T:
+                    ret_energy[t_return] = energy_req
+            away_timesteps[boat] = away_ts
+            return_energy[boat] = ret_energy
+
+        # --------------------------------------------------
+        # SOC variables (kWh) and dynamics per boat
+        # --------------------------------------------------
+        # soc[boat][t] = energy stored in battery at END of timestep t
+        # --------------------------------------------------
+        soc = {}
+        boat_objects = {b.name: b for b in self.port.boats}
+
         for charger in self.port.chargers:
             charger_name = charger.name
             boat = charger_to_boat[charger_name]
-            boat_trips = trip_events.get(boat, [])
+            battery_cap = boat_objects[boat].battery_capacity
+            initial_soc_kwh = boat_objects[boat].soc * battery_cap
 
-            cumulative_energy = 0.0
+            soc[boat] = {
+                t: model.addVar(lb=0, ub=battery_cap, name=f"soc_{boat}_{t}")
+                for t in timesteps
+            }
 
-            for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
-                cumulative_energy += energy_req
-                t_dep = t_deadline  # charge must be done by this timestep
+            away = away_timesteps[boat]
+            ret_e = return_energy[boat]
+
+            for t in timesteps:
+                # --- Zero charger power while at sea ---
+                if t in away:
+                    model.addCons(
+                        charger_power[charger_name][t] == 0,
+                        name=f"away_{boat}_t{t}",
+                    )
+
+                # --- SOC dynamics ---
+                soc_prev = soc[boat][t - 1] if t > 0 else initial_soc_kwh
+                charge_energy = charger_power[charger_name][t] * self.timestep_hours
+
+                # Energy deducted when returning from a trip
+                trip_drain = ret_e.get(t, 0.0)
 
                 model.addCons(
-                    quicksum(
-                        charger_power[charger_name][t] * self.timestep_hours
-                        for t in range(t_dep)
-                    )
-                    >= cumulative_energy * go_trip[(boat, i)]
+                    soc[boat][t] == soc_prev + charge_energy - trip_drain,
+                    name=f"soc_dyn_{boat}_{t}",
+                )
+
+        # --------------------------------------------------
+        # Trip departure constraints: SOC >= trip energy
+        # --------------------------------------------------
+        for boat in self.boat_charger_assignments:
+            boat_trips = trip_events.get(boat, [])
+            for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
+                model.addCons(
+                    soc[boat][t_deadline]
+                    >= energy_req * go_trip[(boat, i)]
                     - BIG_M * (1 - go_trip[(boat, i)]),
                     name=f"trip_{boat}_{i+1}",
+                )
+
+        # --------------------------------------------------
+        # Sequential trip ordering: trip i+1 requires trip i
+        # --------------------------------------------------
+        for boat in self.boat_charger_assignments:
+            boat_trips = trip_events.get(boat, [])
+            for i in range(1, len(boat_trips)):
+                model.addCons(
+                    go_trip[(boat, i)] <= go_trip[(boat, i - 1)],
+                    name=f"seq_{boat}_trip{i+1}",
                 )
 
         # --------------------------------------------------
