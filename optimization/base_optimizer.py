@@ -20,9 +20,6 @@ class BaseOptimizationResult:
     peak_power_kw: float
     total_energy_kwh: float
     total_cost: float
-    bess_schedules: Dict[str, List[Tuple[datetime, float]]] = field(
-        default_factory=dict
-    )  # power: + charge, - discharge
 
 
 class BaseOptimizer:
@@ -48,150 +45,162 @@ class BaseOptimizer:
         forecast_date: datetime,
         energy_forecasts: List[EnergyForecast],
     ) -> BaseOptimizationResult:
-        """Minimize cost (grid x tariff) s.t. grid_import <= contracted_power."""
-        print("     Running base optimization (minimize cost)...")
 
         T = len(energy_forecasts)
         timesteps = list(range(T))
-        num_chargers = len(self.port.chargers)
-        print(
-            f"        {num_chargers} chargers, {T} timesteps, contracted_power={self.port.contracted_power} kW"
-        )
 
         model = Model("base_optimizer")
         model.hideOutput()
-        # model.setRealParam("limits/time", 30.0)
 
+        # --------------------------------------------------
+        # PLACEHOLDER TRIPS (per boat)
+        # --------------------------------------------------
+        TRIPS = [
+            {"t": 35, "energy": 64.0},  # trip 1
+            {"t": 55, "energy": 64.0},  # trip 2
+        ]
+
+        # --------------------------------------------------
         # Grid import
-        grid_import = {}
-        for t in timesteps:
-            grid_import[t] = model.addVar(
-                name=f"grid_{t}", vtype="C", lb=0, ub=self.port.contracted_power
-            )
+        # --------------------------------------------------
+        grid_import = {
+            t: model.addVar(lb=0, ub=self.port.contracted_power, name=f"grid_{t}")
+            for t in timesteps
+        }
 
-        # Charger power
+        # --------------------------------------------------
+        # Charger power variables
+        # --------------------------------------------------
         charger_power = {}
-        for c_idx in range(num_chargers):
-            charger_power[c_idx] = {}
-            for t in timesteps:
-                charger_power[c_idx][t] = model.addVar(
-                    name=f"p_{c_idx}_{t}",
-                    vtype="C",
-                    lb=0,
-                    ub=self.port.chargers[c_idx].max_power,
+        for charger in self.port.chargers:
+            charger_power[charger.name] = {
+                t: model.addVar(
+                    lb=0, ub=charger.max_power, name=f"p_{charger.name}_{t}"
                 )
+                for t in timesteps
+            }
 
-        # Pre-compute PV forecast
-        pv_power = {}
+        # --------------------------------------------------
+        # Power balance
+        # --------------------------------------------------
         for t in timesteps:
-            pv_power[t] = (
-                energy_forecasts[t].power_active_production_kw
-                if self.port.pv_systems
-                else 0.0
-            )
-
-        # PV usage variables (allows curtailment)
-        pv_used = {}
-        for t in timesteps:
-            pv_used[t] = model.addVar(
-                name=f"pv_used_{t}", vtype="C", lb=0, ub=pv_power[t]
-            )
-
-        # BESS power: positive = charging (load), negative = discharging (supply)
-        bess_power = {}
-        if self.port.bess_systems:
-            for b_idx, bess in enumerate(self.port.bess_systems):
-                bess_power[b_idx] = {}
-                for t in timesteps:
-                    bess_power[b_idx][t] = model.addVar(
-                        name=f"bess_{b_idx}_{t}",
-                        vtype="C",
-                        lb=-bess.max_discharge_power,
-                        ub=bess.max_charge_power,
-                    )
-
-        # Tariffs
-        tariff_price = {}
-        for t in timesteps:
-            ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
-            tariff_price[t] = self.port.get_tariff_price(ts)
-
-        # Power Balance: grid + PV + BESS discharge = chargers + BESS charge
-        # (bess_power > 0 = charge = load, bess_power < 0 = discharge = supply)
-        for t in timesteps:
-            load = quicksum(charger_power[c][t] for c in range(num_chargers))
-            if self.port.bess_systems:
-                load = load + quicksum(
-                    bess_power[b][t] for b in range(len(self.port.bess_systems))
-                )
             model.addCons(
-                grid_import[t] + pv_used[t] == load,
+                grid_import[t]
+                == quicksum(charger_power[c.name][t] for c in self.port.chargers),
                 name=f"power_balance_{t}",
             )
 
-        # Objective: minimize cost
-        total_cost = quicksum(
+        # --------------------------------------------------
+        # Boat ↔ charger mapping
+        # --------------------------------------------------
+        charger_to_boat = {
+            self.port.chargers[idx].name: boat
+            for boat, idx in self.boat_charger_assignments.items()
+        }
+
+        # --------------------------------------------------
+        # Trip decision binaries
+        # --------------------------------------------------
+        go_trip = {}  # go_trip[(boat, trip_idx)]
+
+        for boat in self.boat_charger_assignments:
+            for i in range(len(TRIPS)):
+                go_trip[(boat, i)] = model.addVar(
+                    vtype="B", name=f"go_{boat}_trip{i+1}"
+                )
+
+        BIG_M = 1e4  # kWh, safely large
+
+        # --------------------------------------------------
+        # Trip energy constraints (cumulative)
+        # --------------------------------------------------
+        for charger in self.port.chargers:
+            charger_name = charger.name
+            boat = charger_to_boat[charger_name]
+
+            cumulative_energy = 0.0
+
+            for i, trip in enumerate(TRIPS):
+                cumulative_energy += trip["energy"]
+                t_dep = trip["t"]
+
+                model.addCons(
+                    quicksum(
+                        charger_power[charger_name][t] * self.timestep_hours
+                        for t in range(t_dep)
+                    )
+                    >= cumulative_energy * go_trip[(boat, i)]
+                    - BIG_M * (1 - go_trip[(boat, i)]),
+                    name=f"trip_{boat}_{i+1}",
+                )
+
+        # --------------------------------------------------
+        # Tariffs
+        # --------------------------------------------------
+        tariff_price = {
+            t: self.port.get_tariff_price(
+                forecast_date + timedelta(seconds=t * self.timestep_seconds)
+            )
+            for t in timesteps
+        }
+
+        energy_cost = quicksum(
             grid_import[t] * tariff_price[t] * self.timestep_hours for t in timesteps
         )
-        model.setObjective(total_cost, "minimize")
 
+        # --------------------------------------------------
+        # Objective: maximize trips, then minimize cost
+        # --------------------------------------------------
+        trip_reward = quicksum(go_trip.values())
+
+        model.setObjective(
+            -1000 * trip_reward + energy_cost,  # lexicographic via scaling
+            "minimize",
+        )
+
+        # --------------------------------------------------
+        # Solve
+        # --------------------------------------------------
         model.optimize()
         status = model.getStatus()
-        print(f"        SCIP status: {status}")
 
-        # Extract results
+        if status != "optimal":
+            raise RuntimeError(f"SCIP failed ({status})")
+
+        # --------------------------------------------------
+        # Extract schedules (unchanged from your code)
+        # --------------------------------------------------
         charger_schedules = {c.name: [] for c in self.port.chargers}
-        bess_schedules = {b.name: [] for b in self.port.bess_systems}
         peak_power = 0.0
         total_energy = 0.0
         total_cost_val = 0.0
 
-        if status == "optimal":
-            try:
-                for t in timesteps:
-                    timestamp = forecast_date + timedelta(
-                        seconds=t * self.timestep_seconds
-                    )
-                    power_this_t = 0.0
-                    for c_idx, charger in enumerate(self.port.chargers):
-                        p = max(0, model.getVal(charger_power[c_idx][t]))
-                        charger_schedules[charger.name].append((timestamp, p))
-                        power_this_t += p
-                    if self.port.bess_systems:
-                        for b_idx, bess in enumerate(self.port.bess_systems):
-                            pb = model.getVal(bess_power[b_idx][t])
-                            bess_schedules.setdefault(bess.name, []).append(
-                                (timestamp, pb)
-                            )
-                    peak_power = max(peak_power, power_this_t)
-                    total_energy += power_this_t * self.timestep_hours
-                    g = max(0, model.getVal(grid_import[t]))
-                    total_cost_val += g * tariff_price[t] * self.timestep_hours
+        for t in timesteps:
+            ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+            power_t = 0.0
+            for c in self.port.chargers:
+                p = max(0, model.getVal(charger_power[c.name][t]))
+                charger_schedules[c.name].append((ts, p))
+                power_t += p
+            peak_power = max(peak_power, power_t)
+            total_energy += power_t * self.timestep_hours
+            total_cost_val += (
+                model.getVal(grid_import[t]) * tariff_price[t] * self.timestep_hours
+            )
 
-                print("     Base optimization complete")
-                print(
-                    f"       Peak: {peak_power:.1f} kW, Energy: {total_energy:.1f} kWh, Cost: {total_cost_val:.2f}"
-                )
-                # Build boat_schedules from charger_schedules (1:1 mapping)
-                boat_schedules = {}
-                for boat_name, c_idx in self.boat_charger_assignments.items():
-                    charger_name = self.port.chargers[c_idx].name
-                    boat_schedules[boat_name] = list(charger_schedules[charger_name])
-                return BaseOptimizationResult(
-                    status=status,
-                    charger_schedules=charger_schedules,
-                    boat_schedules=boat_schedules,
-                    peak_power_kw=peak_power,
-                    total_energy_kwh=total_energy,
-                    total_cost=total_cost_val,
-                    bess_schedules=bess_schedules,
-                )
-            except Exception as e:
-                print(f"     Error extracting results: {e}, using fallback")
-                raise e
-        else:
-            print(f"     SCIP failed ({status}), using fallback")
-            raise RuntimeError(f"SCIP failed ({status})")
+        boat_schedules = {}
+        for boat, idx in self.boat_charger_assignments.items():
+            charger_name = self.port.chargers[idx].name
+            boat_schedules[boat] = list(charger_schedules[charger_name])
+
+        return BaseOptimizationResult(
+            status=status,
+            charger_schedules=charger_schedules,
+            boat_schedules=boat_schedules,
+            peak_power_kw=peak_power,
+            total_energy_kwh=total_energy,
+            total_cost=total_cost_val,
+        )
 
     def save_schedules_to_db(self, result: BaseOptimizationResult) -> None:
         """Save schedules to database."""
@@ -203,13 +212,6 @@ class BaseOptimizer:
             for timestamp, power in schedule:
                 ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
                 schedules.append((ts_str, charger_src, power_setpoint_met, str(power)))
-
-        # BESS: store as (positive=discharge, negative=charge) for engine
-        for bess_name, schedule in result.bess_schedules.items():
-            bess_src = self.db_manager.get_or_create_source(bess_name, "bess")
-            for timestamp, power in schedule:
-                ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                schedules.append((ts_str, bess_src, power_setpoint_met, str(-power)))
 
         if schedules:
             self.db_manager.save_records_batch("scheduling", schedules)

@@ -596,40 +596,24 @@ class SimulationEngine:
 
     def _assign_boats_to_chargers_with_schedule(self):
         """
-        Assign boats to chargers following the optimizer's BOAT-SPECIFIC power schedules.
+        Assign boats to chargers following the optimizer's CHARGER power schedules.
 
+        Uses the pre-assigned boat→charger mapping to determine each boat's charging power.
         Each boat can only connect to ONE charger at a time (physical constraint).
-        The optimizer should output power values <= charger max power per boat.
 
         IMPORTANT: Updates self.boat_charger_map which _update_charging() uses.
         """
-        from models import (
-            BoatState,
-            ChargerState,
-        )  # Import at top of your file normally
+        from models import BoatState, ChargerState
 
         now = self.current_datetime
         ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
         # ------------------------------------------------------------------
-        # Load scheduled BOAT powers for THIS timestep
+        # Load scheduled CHARGER powers for THIS timestep
         # ------------------------------------------------------------------
-        scheduled_boat_power = {}  # boat_name -> power_kW
+        scheduled_charger_power = {}  # charger_name -> power_kW
         power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
 
-        for boat in self.port.boats:
-            src = self.db_manager.get_or_create_source(boat.name, "boat")
-            rows = self.db_manager.get_records(
-                table="scheduling",
-                source_id=src,
-                metric_id=power_setpoint_met,
-                start_time=ts_str,
-                end_time=ts_str,
-            )
-            scheduled_boat_power[boat.name] = float(rows[0]["value"]) if rows else 0.0
-
-        # Also load charger schedules for debugging
-        scheduled_charger_power = {}
         for charger in self.port.chargers:
             src = self.db_manager.get_or_create_source(charger.name, "charger")
             rows = self.db_manager.get_records(
@@ -643,12 +627,23 @@ class SimulationEngine:
                 float(rows[0]["value"]) if rows else 0.0
             )
 
+        # ------------------------------------------------------------------
+        # Derive BOAT powers from charger schedules using pre-assignments
+        # boat_charger_assignments: {boat_name: charger_index}
+        # ------------------------------------------------------------------
+        scheduled_boat_power = {}
+        for boat_name, charger_idx in self.boat_charger_assignments.items():
+            charger_name = self.port.chargers[charger_idx].name
+            scheduled_boat_power[boat_name] = scheduled_charger_power.get(
+                charger_name, 0.0
+            )
+
         # DEBUG: Print scheduled powers
         if now.hour < 18 and now.minute % 15 == 0:
-            print(f"\n  [DEBUG {ts_str}] Scheduled boat powers: {scheduled_boat_power}")
             print(
-                f"  [DEBUG {ts_str}] Scheduled charger powers: {scheduled_charger_power}"
+                f"\n  [DEBUG {ts_str}] Scheduled charger powers: {scheduled_charger_power}"
             )
+            print(f"  [DEBUG {ts_str}] Derived boat powers: {scheduled_boat_power}")
 
         # ------------------------------------------------------------------
         # Build current charger ↔ boat mapping from charger state (one-to-one)
@@ -692,7 +687,6 @@ class SimulationEngine:
 
                 boat_to_charger.pop(boat_name, None)
                 charger_to_boat.pop(charger_name, None)
-                # CRITICAL: Also remove from self.boat_charger_map
                 self.boat_charger_map.pop(boat_name, None)
 
         # ------------------------------------------------------------------
@@ -731,7 +725,6 @@ class SimulationEngine:
 
                     boat_to_charger.pop(boat.name, None)
                     charger_to_boat.pop(charger_name, None)
-                    # CRITICAL: Also remove from self.boat_charger_map
                     self.boat_charger_map.pop(boat.name, None)
                 continue
 
@@ -744,7 +737,6 @@ class SimulationEngine:
                 charger = next(c for c in self.port.chargers if c.name == charger_name)
 
                 old_power = charger.power
-                # Clamp to charger max power (should already be <= max from optimizer)
                 new_power = min(scheduled_power, charger.max_power)
                 charger.power = new_power
                 charger.state = ChargerState.CHARGING
@@ -775,7 +767,6 @@ class SimulationEngine:
 
                     charger_to_boat[assigned_charger.name] = boat.name
                     boat_to_charger[boat.name] = assigned_charger.name
-                    # CRITICAL: Also add to self.boat_charger_map so _update_charging() works!
                     self.boat_charger_map[boat.name] = assigned_charger.name
 
                     assignments_made.append(
