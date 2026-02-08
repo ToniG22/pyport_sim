@@ -110,7 +110,6 @@ class SimulationEngine:
                 db_manager,
                 settings.timestep,
                 self.boat_charger_assignments,
-                settings.trip_schedule,
             )
 
             print(
@@ -464,8 +463,8 @@ class SimulationEngine:
                 estimated_energy = trip.estimate_energy_required(boat.k)
                 required_soc = estimated_energy / boat.battery_capacity
 
-                # Check if boat now has enough charge
-                if boat.soc >= required_soc:
+                # Check if boat now has enough charge (tolerance for float precision)
+                if boat.soc >= required_soc - 1e-6:
                     # Disconnect from charger if connected
                     if boat_name in self.boat_charger_map:
                         charger_name = self.boat_charger_map[boat_name]
@@ -509,8 +508,8 @@ class SimulationEngine:
                     estimated_energy = trip.estimate_energy_required(boat.k)
                     required_soc = estimated_energy / boat.battery_capacity
 
-                    # Check if boat has enough charge
-                    if boat.soc >= required_soc:
+                    # Check if boat has enough charge (tolerance for float precision)
+                    if boat.soc >= required_soc - 1e-6:
                         # Disconnect from charger if connected
                         if boat_name in self.boat_charger_map:
                             charger_name = self.boat_charger_map[boat_name]
@@ -552,9 +551,7 @@ class SimulationEngine:
         if start_elapsed >= end_elapsed:
             return
 
-        energy_consumed = trip.get_energy_between(
-            start_elapsed, end_elapsed, boat.k
-        )
+        energy_consumed = trip.get_energy_between(start_elapsed, end_elapsed, boat.k)
         soc_decrease = energy_consumed / boat.battery_capacity
         boat.soc = max(0, boat.soc - soc_decrease)
 
