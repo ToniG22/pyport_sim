@@ -163,6 +163,44 @@ class Trip:
 
         return total_energy
 
+    def get_energy_between(
+        self, start_elapsed_seconds: float, end_elapsed_seconds: float, boat_k_factor: float
+    ) -> float:
+        """
+        Energy consumed in the time window [start_elapsed, end_elapsed] using the
+        same segment-based integration as estimate_energy_required. Use this in
+        the simulation so in-trip discharge matches the predicted requirement.
+
+        Args:
+            start_elapsed_seconds: Start of window (s from trip start)
+            end_elapsed_seconds: End of window (s from trip start)
+            boat_k_factor: Boat k factor (motor_power / range_speed^3)
+
+        Returns:
+            Energy in kWh for that window
+        """
+        if not self.points or start_elapsed_seconds >= end_elapsed_seconds:
+            return 0.0
+
+        t0 = self.points[0].timestamp
+        total_energy = 0.0
+        for i in range(len(self.points) - 1):
+            point = self.points[i]
+            next_point = self.points[i + 1]
+            seg_start = (point.timestamp - t0).total_seconds()
+            seg_end = (next_point.timestamp - t0).total_seconds()
+
+            overlap_start = max(seg_start, start_elapsed_seconds)
+            overlap_end = min(seg_end, end_elapsed_seconds)
+            duration = max(0.0, overlap_end - overlap_start)
+            if duration <= 0:
+                continue
+
+            power_kw = boat_k_factor * (point.speed**3)
+            total_energy += (power_kw * duration) / 3600
+
+        return total_energy
+
     def __repr__(self) -> str:
         return (
             f"Trip(route={self.route_name}, points={len(self.points)}, "

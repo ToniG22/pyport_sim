@@ -430,6 +430,8 @@ class SimulationEngine:
 
                 # Check if trip is complete
                 if elapsed >= trip.duration:
+                    # Discharge for final partial timestep [elapsed - timestep, duration]
+                    self._discharge_boat_on_trip(boat, trip, elapsed)
                     # Trip completed, return to port
                     boat.state = BoatState.IDLE
                     print(
@@ -438,7 +440,7 @@ class SimulationEngine:
                     del self.active_trips[boat_name]
 
                 else:
-                    # Still on trip, discharge battery based on current speed from CSV
+                    # Still on trip, discharge battery (same segment-based energy as requirement)
                     self._discharge_boat_on_trip(boat, trip, elapsed)
                     self.active_trips[boat_name] = (trip, start_time, elapsed)
                 continue
@@ -543,21 +545,16 @@ class SimulationEngine:
                         break
 
     def _discharge_boat_on_trip(self, boat, trip: Trip, elapsed_seconds: float):
-        """Discharge boat battery during trip based on CSV speed data."""
-        # Get current point in the trip
-        point = trip.get_point_at_elapsed_time(elapsed_seconds)
-
-        if point is None:
+        """Discharge boat battery using the same segment-based energy as the requirement estimate."""
+        # Energy for the period that just passed: [elapsed - timestep, elapsed], capped at trip end
+        start_elapsed = max(0.0, elapsed_seconds - self.settings.timestep)
+        end_elapsed = min(elapsed_seconds, trip.duration)
+        if start_elapsed >= end_elapsed:
             return
 
-        # Calculate power consumption based on actual speed from CSV
-        speed_knots = point.speed
-        power_kw = boat.k * (speed_knots**3)
-
-        # Energy consumed in this timestep (kWh)
-        energy_consumed = (power_kw * self.settings.timestep) / 3600
-
-        # Update SOC
+        energy_consumed = trip.get_energy_between(
+            start_elapsed, end_elapsed, boat.k
+        )
         soc_decrease = energy_consumed / boat.battery_capacity
         boat.soc = max(0, boat.soc - soc_decrease)
 
