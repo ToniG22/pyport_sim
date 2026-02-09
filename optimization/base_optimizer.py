@@ -97,42 +97,52 @@ class BaseOptimizer:
         }
 
         # --------------------------------------------------
-        # Trip decision binaries (per boat, using its own trips)
+        # Shortfall & fully-ready variables (per boat, per trip)
         # --------------------------------------------------
-        go_trip = {}  # go_trip[(boat, trip_idx)]
+        # shortfall[(boat, i)]  – continuous >= 0, energy missing at deadline
+        # fully_ready[(boat, i)] – binary, 1 iff shortfall == 0
+        # --------------------------------------------------
+        shortfall = {}
+        fully_ready = {}
+        BIG_M = 1e4  # kWh, safely large
 
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
             for i in range(len(boat_trips)):
-                go_trip[(boat, i)] = model.addVar(
-                    vtype="B", name=f"go_{boat}_trip{i+1}"
+                _, energy_req, _ = boat_trips[i]
+                shortfall[(boat, i)] = model.addVar(
+                    lb=0, ub=energy_req, name=f"shortfall_{boat}_trip{i+1}"
                 )
-
-        BIG_M = 1e4  # kWh, safely large
+                fully_ready[(boat, i)] = model.addVar(
+                    vtype="B", name=f"ready_{boat}_trip{i+1}"
+                )
 
         # --------------------------------------------------
         # Build per-boat trip lookup structures
         # --------------------------------------------------
         # away_timesteps[boat]: set of timesteps when boat is at sea
-        # return_energy[boat][t]: energy consumed by the trip that
-        #   ends just before timestep t (deducted when boat returns)
+        # return_drain[boat][t]: (energy_req, trip_index) for the trip
+        #   that ends just before timestep t — we deduct
+        #   (energy_req - shortfall) when the boat returns.
         # --------------------------------------------------
         away_timesteps = {}
-        return_energy = {}
+        return_drain = {}
 
         for boat in self.boat_charger_assignments:
             away_ts = set()
-            ret_energy = {}
-            for t_deadline, energy_req, dur in trip_events.get(boat, []):
+            ret_drain = {}
+            for i, (t_deadline, energy_req, dur) in enumerate(
+                trip_events.get(boat, [])
+            ):
                 t_depart = t_deadline + 1
                 t_return = t_depart + dur  # first timestep back at port
                 for t in range(t_depart, min(t_return, T)):
                     away_ts.add(t)
-                # Deduct trip energy at the return timestep
+                # Record drain info at return timestep
                 if t_return < T:
-                    ret_energy[t_return] = energy_req
+                    ret_drain[t_return] = (energy_req, i)
             away_timesteps[boat] = away_ts
-            return_energy[boat] = ret_energy
+            return_drain[boat] = ret_drain
 
         # --------------------------------------------------
         # SOC variables (kWh) and dynamics per boat
@@ -156,7 +166,7 @@ class BaseOptimizer:
             }
 
             away = away_timesteps[boat]
-            ret_e = return_energy[boat]
+            ret_drain_map = return_drain[boat]
 
             for t in timesteps:
                 # --- Zero charger power while at sea ---
@@ -168,13 +178,18 @@ class BaseOptimizer:
 
                 # --- SOC dynamics ---
                 soc_prev = soc[boat][t - 1] if t > 0 else initial_soc_kwh
-                # Apply charger efficiency: battery receives power × η
                 charge_energy = (
                     charger_power[charger_name][t] * charger_eff * self.timestep_hours
                 )
 
-                # Energy deducted when returning from a trip
-                trip_drain = ret_e.get(t, 0.0)
+                # Energy deducted when returning from a trip.
+                # Actual drain = energy_req - shortfall  (boat only loses
+                # what it actually had available).
+                if t in ret_drain_map:
+                    energy_req, trip_idx = ret_drain_map[t]
+                    trip_drain = energy_req - shortfall[(boat, trip_idx)]
+                else:
+                    trip_drain = 0.0
 
                 model.addCons(
                     soc[boat][t] == soc_prev + charge_energy - trip_drain,
@@ -182,37 +197,29 @@ class BaseOptimizer:
                 )
 
         # --------------------------------------------------
-        # Trip departure constraints: SOC >= trip energy
+        # Shortfall definition: shortfall >= energy_req - soc at deadline
         # --------------------------------------------------
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
-
             for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
                 model.addCons(
-                    soc[boat][t_deadline]
-                    >= energy_req * go_trip[(boat, i)]
-                    - BIG_M * (1 - go_trip[(boat, i)]),
-                    name=f"trip_{boat}_{i+1}",
+                    shortfall[(boat, i)] >= energy_req - soc[boat][t_deadline],
+                    name=f"shortfall_def_{boat}_trip{i+1}",
                 )
 
         # --------------------------------------------------
-        # Sequential trip ordering: trip i+1 requires trip i
+        # Link fully_ready to shortfall:
+        #   shortfall <= BIG_M * (1 - fully_ready)
+        # i.e. fully_ready=1  =>  shortfall=0
         # --------------------------------------------------
-        for boat in self.boat_charger_assignments:
-            boat_trips = trip_events.get(boat, [])
-            for i in range(1, len(boat_trips)):
-                model.addCons(
-                    go_trip[(boat, i)] <= go_trip[(boat, i - 1)],
-                    name=f"seq_{boat}_trip{i+1}",
-                )
+        for key in shortfall:
+            model.addCons(
+                shortfall[key] <= BIG_M * (1 - fully_ready[key]),
+                name=f"link_ready_{key[0]}_trip{key[1]+1}",
+            )
 
         # --------------------------------------------------
         # Symmetry breaking: enforce ordering among boats
-        # --------------------------------------------------
-        # With identical boats, the optimizer can spread power
-        # equally and no single boat reaches the threshold.
-        # Force: go_trip[(boat_k, i)] <= go_trip[(boat_k-1, i)]
-        # so boat_0 goes before boat_1, boat_1 before boat_2, etc.
         # --------------------------------------------------
         boat_list = list(self.boat_charger_assignments.keys())
         max_trips_per_boat = max(
@@ -223,9 +230,9 @@ class BaseOptimizer:
             for k in range(1, len(boat_list)):
                 b_prev = boat_list[k - 1]
                 b_curr = boat_list[k]
-                if (b_prev, i) in go_trip and (b_curr, i) in go_trip:
+                if (b_prev, i) in fully_ready and (b_curr, i) in fully_ready:
                     model.addCons(
-                        go_trip[(b_curr, i)] <= go_trip[(b_prev, i)],
+                        fully_ready[(b_curr, i)] <= fully_ready[(b_prev, i)],
                         name=f"sym_{b_curr}_trip{i+1}",
                     )
 
@@ -244,23 +251,29 @@ class BaseOptimizer:
         )
 
         # --------------------------------------------------
-        # Objective: maximize trips (with priority), minimize cost
+        # Objective
         # --------------------------------------------------
-        # Each go_trip gets a large reward so the optimizer
-        # maximizes the total number of trips completed.
-        # A small decreasing bonus per boat index breaks ties
-        # and encourages concentrating on fewer boats first.
+        # 1) Huge bonus for each fully-ready trip (maximise count)
+        # 2) Penalise remaining shortfall (drives partial gaps to 0)
+        # 3) Minimise energy cost
         # --------------------------------------------------
         n_boats = len(boat_list)
-        trip_reward = quicksum(
-            (1000 + (n_boats - k) * 0.1) * go_trip[(boat_list[k], i)]
+
+        # Large reward per fully-ready boat-trip, with small
+        # tie-breaking bonus favouring earlier boats.
+        ready_reward = quicksum(
+            (1000 + (n_boats - k) * 0.1) * fully_ready[(boat_list[k], i)]
             for i in range(max_trips_per_boat)
             for k in range(n_boats)
-            if (boat_list[k], i) in go_trip
+            if (boat_list[k], i) in fully_ready
         )
 
+        # Penalise any remaining shortfall so the optimizer
+        # still tries to reduce partial gaps.
+        shortfall_penalty = quicksum(10 * shortfall[key] for key in shortfall)
+
         model.setObjective(
-            -trip_reward + energy_cost,
+            -ready_reward + shortfall_penalty + energy_cost,
             "minimize",
         )
 
