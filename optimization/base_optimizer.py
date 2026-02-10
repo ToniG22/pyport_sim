@@ -1,4 +1,11 @@
-"""Base optimizer: minimize cost subject to import <= contracted_power."""
+"""Base optimizer: minimize cost subject to import <= contracted_power.
+
+Supports PV production (free solar) and BESS (battery storage) to reduce
+grid import costs.  The power balance is:
+
+    grid_import + pv_production + Σ bess_discharge
+        = Σ charger_power + Σ bess_charge + pv_export
+"""
 
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -34,6 +41,7 @@ class BaseOptimizer:
         trip_schedule: tuple = ((9, 0), (14, 1)),
         max_slack_timesteps: int = 8,
         deadline_decay_factor: float = 0.5,
+        bess_end_soc_penalty: float = 0.5,
     ):
         self.port = port
         self.db_manager = db_manager
@@ -43,6 +51,7 @@ class BaseOptimizer:
         self.trip_schedule = trip_schedule
         self.max_slack_timesteps = max_slack_timesteps
         self.deadline_decay_factor = deadline_decay_factor
+        self.bess_end_soc_penalty = bess_end_soc_penalty
 
         # Pre-compute per-boat battery capacities for tight Big-M bounds
         self._boat_battery_cap = {b.name: b.battery_capacity for b in self.port.boats}
@@ -79,8 +88,29 @@ class BaseOptimizer:
         # --- Decision variables ---
         grid_import = self._add_grid_import_vars(model, timesteps)
         charger_power = self._add_charger_power_vars(model, timesteps)
+
+        # --- PV (parameter) + BESS (variables) + export (slack) ---
+        pv_forecast = self._get_pv_forecast(energy_forecasts, timesteps)
+        pv_export = self._add_export_vars(model, timesteps)
+        bess_charge, bess_discharge, bess_soc = self._add_bess_variables(
+            model, timesteps
+        )
+
+        # --- Power balance (expanded with PV + BESS) ---
         self._add_power_balance_constraints(
-            model, timesteps, grid_import, charger_power
+            model,
+            timesteps,
+            grid_import,
+            charger_power,
+            pv_forecast,
+            bess_charge,
+            bess_discharge,
+            pv_export,
+        )
+
+        # --- BESS SOC dynamics ---
+        self._add_bess_soc_dynamics(
+            model, timesteps, bess_charge, bess_discharge, bess_soc
         )
 
         # --- Departure / at-sea variables ---
@@ -128,6 +158,7 @@ class BaseOptimizer:
             boat_list,
             trip_events,
             departure_ctx,
+            bess_soc,
         )
 
         # --- Solve ---
@@ -138,8 +169,10 @@ class BaseOptimizer:
 
         # --- Post-processing ---
         self._log_departure_decisions(model, forecast_date, trip_events, departure_ctx)
+        self._log_bess_summary(model, timesteps, bess_charge, bess_discharge, bess_soc)
+        self._log_pv_summary(model, timesteps, pv_forecast, pv_export)
 
-        return self._extract_results(
+        result = self._extract_results(
             model,
             forecast_date,
             timesteps,
@@ -148,6 +181,13 @@ class BaseOptimizer:
             tariff_price,
             status,
         )
+
+        # Save BESS schedules to DB alongside charger schedules
+        self._save_bess_schedules_to_db(
+            model, forecast_date, timesteps, bess_charge, bess_discharge
+        )
+
+        return result
 
     # ------------------------------------------------------------------ #
     #  Variable & constraint builders                                      #
@@ -170,15 +210,125 @@ class BaseOptimizer:
             }
         return charger_power
 
-    def _add_power_balance_constraints(
-        self, model, timesteps, grid_import, charger_power
+    # ------------------------------------------------------------------ #
+    #  PV, BESS, and export variables                                      #
+    # ------------------------------------------------------------------ #
+
+    def _get_pv_forecast(self, energy_forecasts, timesteps):
+        """PV production per timestep (known parameter, not a decision variable)."""
+        return {t: energy_forecasts[t].power_active_production_kw for t in timesteps}
+
+    def _add_export_vars(self, model, timesteps):
+        """Slack variable for excess power (PV curtailment / grid export)."""
+        return {t: model.addVar(lb=0, name=f"export_{t}") for t in timesteps}
+
+    def _add_bess_variables(self, model, timesteps):
+        """BESS charge, discharge, and SOC variables for each BESS system."""
+        bess_charge = {}
+        bess_discharge = {}
+        bess_soc = {}
+
+        for bess in self.port.bess_systems:
+            bess_charge[bess.name] = {
+                t: model.addVar(
+                    lb=0,
+                    ub=bess.max_charge_power,
+                    name=f"bess_chg_{bess.name}_{t}",
+                )
+                for t in timesteps
+            }
+            bess_discharge[bess.name] = {
+                t: model.addVar(
+                    lb=0,
+                    ub=bess.max_discharge_power,
+                    name=f"bess_dis_{bess.name}_{t}",
+                )
+                for t in timesteps
+            }
+            bess_soc[bess.name] = {
+                t: model.addVar(
+                    lb=bess.soc_min * bess.capacity,
+                    ub=bess.soc_max * bess.capacity,
+                    name=f"bess_soc_{bess.name}_{t}",
+                )
+                for t in timesteps
+            }
+
+        return bess_charge, bess_discharge, bess_soc
+
+    def _add_bess_soc_dynamics(
+        self, model, timesteps, bess_charge, bess_discharge, bess_soc
     ):
+        """BESS SOC tracking — matches the simulation's BESS model efficiency."""
+        for bess in self.port.bess_systems:
+            initial_soc_kwh = bess.current_soc * bess.capacity
+
+            for t in timesteps:
+                soc_prev = bess_soc[bess.name][t - 1] if t > 0 else initial_soc_kwh
+
+                # Simulation applies sqrt(η_rt) on each direction:
+                #   charge:    energy_in  = power * η * Δt
+                #   discharge: energy_out = power * (1/η) * Δt
+                # where η = bess.efficiency (the round-trip efficiency).
+                energy_in = (
+                    bess_charge[bess.name][t] * bess.efficiency * self.timestep_hours
+                )
+                energy_out = (
+                    bess_discharge[bess.name][t]
+                    * (1.0 / bess.efficiency)
+                    * self.timestep_hours
+                )
+
+                model.addCons(
+                    bess_soc[bess.name][t] == soc_prev + energy_in - energy_out,
+                    name=f"bess_soc_dyn_{bess.name}_{t}",
+                )
+
+    # ------------------------------------------------------------------ #
+    #  Power balance (expanded)                                            #
+    # ------------------------------------------------------------------ #
+
+    def _add_power_balance_constraints(
+        self,
+        model,
+        timesteps,
+        grid_import,
+        charger_power,
+        pv_forecast,
+        bess_charge,
+        bess_discharge,
+        pv_export,
+    ):
+        """
+        Power balance at each timestep:
+
+            grid_import + pv_production + Σ bess_discharge
+                = Σ charger_power + Σ bess_charge + pv_export
+
+        When there are no PV systems or BESS, the extra terms are zero and the
+        constraint collapses to the original  grid_import = Σ charger_power.
+        """
         for t in timesteps:
-            model.addCons(
-                grid_import[t]
-                == quicksum(charger_power[c.name][t] for c in self.port.chargers),
-                name=f"power_balance_{t}",
-            )
+            # Supply side
+            supply = grid_import[t] + pv_forecast[t]
+            if self.port.bess_systems:
+                supply += quicksum(
+                    bess_discharge[b.name][t] for b in self.port.bess_systems
+                )
+
+            # Demand side
+            demand = quicksum(charger_power[c.name][t] for c in self.port.chargers)
+            if self.port.bess_systems:
+                demand += quicksum(
+                    bess_charge[b.name][t] for b in self.port.bess_systems
+                )
+            demand += pv_export[t]
+
+            model.addCons(supply == demand, name=f"power_balance_{t}")
+
+    # ------------------------------------------------------------------ #
+    #  Departure / at-sea / drain / boat-SOC (unchanged from original)     #
+    # ------------------------------------------------------------------ #
 
     def _add_departure_variables(self, model, T, timesteps, trip_events, boat_list):
         """Create depart_at, did_depart, fully_ready, at_sea variables and constraints."""
@@ -239,8 +389,6 @@ class BaseOptimizer:
                             all_sea_times.add(t_sea)
 
                 for t in all_sea_times:
-                    # Continuous [0,1]: forced to integrality by equality
-                    # link to binary depart_at vars — avoids unnecessary branching.
                     at_sea[(boat, i, t)] = model.addVar(
                         lb=0, ub=1, vtype="C", name=f"sea_{boat}_trip{i+1}_t{t}"
                     )
@@ -279,8 +427,6 @@ class BaseOptimizer:
                     if (boat, i, t) in at_sea
                 ]
                 if sea_vars:
-                    # Continuous [0,1]: forced to integrality by equality
-                    # link to binary depart_at vars — avoids unnecessary branching.
                     boat_away[(boat, t)] = model.addVar(
                         lb=0, ub=1, vtype="C", name=f"away_{boat}_t{t}"
                     )
@@ -351,7 +497,11 @@ class BaseOptimizer:
             charger_eff = charger_objects[charger_name].efficiency
 
             soc[boat] = {
-                t: model.addVar(lb=0, ub=battery_cap, name=f"soc_{boat}_{t}")
+                t: model.addVar(
+                    lb=0,
+                    ub=battery_cap * 0.99,  # Match simulation's disconnect threshold
+                    name=f"soc_{boat}_{t}",
+                )
                 for t in timesteps
             }
 
@@ -389,16 +539,13 @@ class BaseOptimizer:
         """SOC >= energy_req at actual departure (hard constraint).
 
         Uses tight Big-M = battery_capacity per boat instead of a loose
-        fixed constant.  This strengthens the LP relaxation and helps the
-        solver prune branches much faster.
+        fixed constant.
         """
         depart_at = departure_ctx["depart_at"]
         depart_slots = departure_ctx["depart_slots"]
 
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
-            # Tight Big-M: the max possible gap between SOC and energy_req
-            # is at most battery_capacity (SOC ∈ [0, battery_cap], energy_req >= 0).
             big_m = self._boat_battery_cap[boat]
 
             for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
@@ -451,17 +598,18 @@ class BaseOptimizer:
         boat_list,
         trip_events,
         departure_ctx,
+        bess_soc,
     ):
         depart_at = departure_ctx["depart_at"]
         depart_slots = departure_ctx["depart_slots"]
         did_depart = departure_ctx["did_depart"]
 
-        # Energy cost
+        # ----- Energy cost (only grid import carries a tariff) -----
         energy_cost = quicksum(
             grid_import[t] * tariff_price[t] * self.timestep_hours for t in timesteps
         )
 
-        # Decaying reward for departure time
+        # ----- Decaying reward for on-time departure -----
         n_boats = len(boat_list)
         base_reward = 1000.0
         ready_reward_terms = []
@@ -480,7 +628,7 @@ class BaseOptimizer:
 
         ready_reward = quicksum(ready_reward_terms) if ready_reward_terms else 0
 
-        # Missed-trip penalty
+        # ----- Missed-trip penalty -----
         missed_penalty_terms = []
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
@@ -492,13 +640,31 @@ class BaseOptimizer:
             quicksum(missed_penalty_terms) if missed_penalty_terms else 0
         )
 
+        # ----- BESS end-of-day SOC penalty (soft target) -----
+        # Penalise ending the day with less stored energy than we started with.
+        # This prevents the optimizer from "free-riding" on stored energy
+        # without replenishing it.
+        bess_end_penalty = 0
+        if self.port.bess_systems and self.bess_end_soc_penalty > 0:
+            T_last = timesteps[-1]
+            bess_shortfall_terms = []
+            for bess in self.port.bess_systems:
+                target_kwh = bess.current_soc * bess.capacity
+                shortfall = model.addVar(lb=0, name=f"bess_end_short_{bess.name}")
+                model.addCons(
+                    shortfall >= target_kwh - bess_soc[bess.name][T_last],
+                    name=f"bess_end_target_{bess.name}",
+                )
+                bess_shortfall_terms.append(self.bess_end_soc_penalty * shortfall)
+            bess_end_penalty = quicksum(bess_shortfall_terms)
+
         model.setObjective(
-            -ready_reward + missed_trip_penalty + energy_cost,
+            -ready_reward + missed_trip_penalty + energy_cost + bess_end_penalty,
             "minimize",
         )
 
     # ------------------------------------------------------------------ #
-    #  Post-solve extraction                                               #
+    #  Post-solve logging                                                  #
     # ------------------------------------------------------------------ #
 
     def _log_departure_decisions(
@@ -530,6 +696,62 @@ class BaseOptimizer:
                         break
                 if not departed:
                     print(f"     {boat} trip {i+1}: SKIPPED (infeasible)")
+
+    def _log_bess_summary(
+        self, model, timesteps, bess_charge, bess_discharge, bess_soc
+    ):
+        """Print a short BESS utilisation summary after solve."""
+        if not self.port.bess_systems:
+            return
+
+        for bess in self.port.bess_systems:
+            total_charged = sum(
+                model.getVal(bess_charge[bess.name][t]) * self.timestep_hours
+                for t in timesteps
+            )
+            total_discharged = sum(
+                model.getVal(bess_discharge[bess.name][t]) * self.timestep_hours
+                for t in timesteps
+            )
+            soc_start = bess.current_soc * bess.capacity
+            soc_end = model.getVal(bess_soc[bess.name][timesteps[-1]])
+            peak_discharge = max(
+                model.getVal(bess_discharge[bess.name][t]) for t in timesteps
+            )
+
+            print(f"     🔋 {bess.name}:")
+            print(
+                f"        Charged:    {total_charged:7.2f} kWh   "
+                f"Discharged: {total_discharged:7.2f} kWh"
+            )
+            print(
+                f"        SOC start:  {soc_start:7.2f} kWh   "
+                f"SOC end:    {soc_end:7.2f} kWh"
+            )
+            print(f"        Peak discharge power: {peak_discharge:.2f} kW")
+
+    def _log_pv_summary(self, model, timesteps, pv_forecast, pv_export):
+        """Print a short PV utilisation summary after solve."""
+        if not self.port.pv_systems:
+            return
+
+        total_pv = sum(pv_forecast[t] * self.timestep_hours for t in timesteps)
+        total_export = sum(
+            model.getVal(pv_export[t]) * self.timestep_hours for t in timesteps
+        )
+        total_used = total_pv - total_export
+        pct_used = (total_used / total_pv * 100) if total_pv > 0 else 0
+
+        print(f"     ☀️  PV:")
+        print(
+            f"        Produced: {total_pv:7.2f} kWh   "
+            f"Used: {total_used:7.2f} kWh ({pct_used:.1f}%)"
+        )
+        print(f"        Exported / curtailed: {total_export:7.2f} kWh")
+
+    # ------------------------------------------------------------------ #
+    #  Post-solve extraction                                               #
+    # ------------------------------------------------------------------ #
 
     def _extract_results(
         self,
@@ -623,7 +845,7 @@ class BaseOptimizer:
     # ------------------------------------------------------------------ #
 
     def save_schedules_to_db(self, result: BaseOptimizationResult) -> None:
-        """Save schedules to database."""
+        """Save charger schedules to database."""
         schedules = []
         power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
 
@@ -635,4 +857,35 @@ class BaseOptimizer:
 
         if schedules:
             self.db_manager.save_records_batch("scheduling", schedules)
-            print(f"     Saved {len(schedules)} schedule entries")
+            print(f"     Saved {len(schedules)} charger schedule entries")
+
+    def _save_bess_schedules_to_db(
+        self, model, forecast_date, timesteps, bess_charge, bess_discharge
+    ):
+        """Save BESS charge/discharge schedules to database.
+
+        Convention: positive = discharge, negative = charge (matches BESS.current_power).
+        """
+        if not self.port.bess_systems:
+            return
+
+        schedules = []
+        power_setpoint_met = self.db_manager.get_metric_id("power_setpoint")
+
+        for bess in self.port.bess_systems:
+            bess_src = self.db_manager.get_or_create_source(bess.name, "bess")
+            for t in timesteps:
+                ts = forecast_date + timedelta(seconds=t * self.timestep_seconds)
+                ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+
+                chg = model.getVal(bess_charge[bess.name][t])
+                dis = model.getVal(bess_discharge[bess.name][t])
+
+                # Net power: positive = discharge, negative = charge
+                net_power = dis - chg
+
+                schedules.append((ts_str, bess_src, power_setpoint_met, str(net_power)))
+
+        if schedules:
+            self.db_manager.save_records_batch("scheduling", schedules)
+            print(f"     Saved {len(schedules)} BESS schedule entries")

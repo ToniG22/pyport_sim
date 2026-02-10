@@ -213,18 +213,6 @@ def main():
     charger11 = Charger(
         name="FastCharger_K", max_power=22, efficiency=0.95
     )  #  Adjust max_power (kW) and efficiency
-    charger12 = Charger(
-        name="FastCharger_L", max_power=22, efficiency=0.95
-    )  #  Adjust max_power (kW) and efficiency
-    charger13 = Charger(
-        name="FastCharger_M", max_power=22, efficiency=0.95
-    )  #  Adjust max_power (kW) and efficiency
-    charger14 = Charger(
-        name="FastCharger_N", max_power=22, efficiency=0.95
-    )  #  Adjust max_power (kW) and efficiency
-    charger15 = Charger(
-        name="FastCharger_O", max_power=22, efficiency=0.95
-    )  #  Adjust max_power (kW) and efficiency
 
     # PV system configuration
     #  Modify PV capacity, tilt, azimuth, efficiency, or remove PV system entirely
@@ -263,10 +251,6 @@ def main():
     port.add_boat(boat9)
     port.add_boat(boat10)
     port.add_boat(boat11)
-    port.add_boat(boat12)
-    port.add_boat(boat13)
-    port.add_boat(boat14)
-    port.add_boat(boat15)
     port.add_charger(charger1)
     port.add_charger(charger2)
     port.add_charger(charger3)
@@ -278,20 +262,20 @@ def main():
     port.add_charger(charger9)
     port.add_charger(charger10)
     port.add_charger(charger11)
-    port.add_charger(charger12)
-    port.add_charger(charger13)
-    port.add_charger(charger14)
-    port.add_charger(charger15)
+    # port.add_charger(charger12)
+    # port.add_charger(charger13)
+    # port.add_charger(charger14)
+    # port.add_charger(charger15)
     # No PV system or BESS
     # port.add_pv(pv_system)
     # port.add_bess(bess)
 
     print(f"\nPort: {port}")
     print(
-        f"Boats: {boat1.name}, {boat2.name}, {boat3.name}, {boat4.name}, {boat5.name} {boat6.name}, {boat7.name}, {boat8.name}, {boat9.name}, {boat10.name}, {boat11.name}, {boat12.name}, {boat13.name}, {boat14.name}, {boat15.name}"
+        f"Boats: {boat1.name}, {boat2.name}, {boat3.name}, {boat4.name}, {boat5.name} {boat6.name}, {boat7.name}, {boat8.name}, {boat9.name}, {boat10.name}, {boat11.name}"
     )
     print(
-        f"Chargers: {charger1.name}, {charger2.name}, {charger3.name}, {charger4.name}, {charger5.name}, {charger6.name}, {charger7.name}, {charger8.name}, {charger9.name}, {charger10.name}, {charger11.name}, {charger12.name}, {charger13.name}, {charger14.name}, {charger15.name}"
+        f"Chargers: {charger1.name}, {charger2.name}, {charger3.name}, {charger4.name}, {charger5.name}, {charger6.name}, {charger7.name}, {charger8.name}, {charger9.name}, {charger10.name}, {charger11.name}"
     )
     # print(f"PV: {pv_system}")
     # print(f"BESS: {bess}")
