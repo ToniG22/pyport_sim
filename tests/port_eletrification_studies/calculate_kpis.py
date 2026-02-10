@@ -33,7 +33,7 @@ SCENARIOS = [
     ("opt_der", "Optimization + DER", True),
 ]
 
-VESSEL_COUNTS = [5, 10]
+VESSEL_COUNTS = [5, 10, 20]
 
 
 def get_db_path(vessels: int, scenario: str) -> str:
