@@ -25,8 +25,6 @@ class BaseOptimizationResult:
 class BaseOptimizer:
     """Minimize cost. Single constraint: grid import <= contracted_power."""
 
-    BIG_M = 1e4
-
     def __init__(
         self,
         port: Port,
@@ -46,6 +44,9 @@ class BaseOptimizer:
         self.max_slack_timesteps = max_slack_timesteps
         self.deadline_decay_factor = deadline_decay_factor
 
+        # Pre-compute per-boat battery capacities for tight Big-M bounds
+        self._boat_battery_cap = {b.name: b.battery_capacity for b in self.port.boats}
+
     # ------------------------------------------------------------------ #
     #  Public entry point                                                  #
     # ------------------------------------------------------------------ #
@@ -61,7 +62,7 @@ class BaseOptimizer:
 
         model = Model("base_optimizer")
         model.hideOutput()
-        model.setParam("limits/time", 120)
+        # model.setParam("limits/time", 120)
 
         trip_events = self._extract_trip_events(energy_forecasts)
         print("TRIP EVENTS", trip_events)
@@ -381,12 +382,21 @@ class BaseOptimizer:
         return soc
 
     def _add_departure_soc_constraints(self, model, T, trip_events, soc, departure_ctx):
-        """SOC >= energy_req at actual departure (hard constraint)."""
+        """SOC >= energy_req at actual departure (hard constraint).
+
+        Uses tight Big-M = battery_capacity per boat instead of a loose
+        fixed constant.  This strengthens the LP relaxation and helps the
+        solver prune branches much faster.
+        """
         depart_at = departure_ctx["depart_at"]
         depart_slots = departure_ctx["depart_slots"]
 
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
+            # Tight Big-M: the max possible gap between SOC and energy_req
+            # is at most battery_capacity (SOC ∈ [0, battery_cap], energy_req >= 0).
+            big_m = self._boat_battery_cap[boat]
+
             for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
                 t_orig_depart = t_deadline + 1
                 slots = depart_slots[(boat, i)]
@@ -397,7 +407,7 @@ class BaseOptimizer:
                         continue
                     model.addCons(
                         soc[boat][t_dl]
-                        >= energy_req - self.BIG_M * (1 - depart_at[(boat, i, s)]),
+                        >= energy_req - big_m * (1 - depart_at[(boat, i, s)]),
                         name=f"soc_req_{boat}_trip{i+1}_s{s}",
                     )
 
