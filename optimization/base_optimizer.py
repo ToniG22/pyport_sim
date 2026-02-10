@@ -239,8 +239,10 @@ class BaseOptimizer:
                             all_sea_times.add(t_sea)
 
                 for t in all_sea_times:
+                    # Continuous [0,1]: forced to integrality by equality
+                    # link to binary depart_at vars — avoids unnecessary branching.
                     at_sea[(boat, i, t)] = model.addVar(
-                        vtype="B", name=f"sea_{boat}_trip{i+1}_t{t}"
+                        lb=0, ub=1, vtype="C", name=f"sea_{boat}_trip{i+1}_t{t}"
                     )
 
                 for t in all_sea_times:
@@ -277,8 +279,10 @@ class BaseOptimizer:
                     if (boat, i, t) in at_sea
                 ]
                 if sea_vars:
+                    # Continuous [0,1]: forced to integrality by equality
+                    # link to binary depart_at vars — avoids unnecessary branching.
                     boat_away[(boat, t)] = model.addVar(
-                        vtype="B", name=f"away_{boat}_t{t}"
+                        lb=0, ub=1, vtype="C", name=f"away_{boat}_t{t}"
                     )
                     model.addCons(
                         boat_away[(boat, t)] == quicksum(sea_vars),
