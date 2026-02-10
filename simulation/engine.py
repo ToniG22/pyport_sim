@@ -464,7 +464,7 @@ class SimulationEngine:
                 required_soc = estimated_energy / boat.battery_capacity
 
                 # Check if boat now has enough charge (tolerance for float precision)
-                if boat.soc >= required_soc - 1e-6:
+                if boat.soc >= (int(required_soc * 100) / 100):
                     # Disconnect from charger if connected
                     if boat_name in self.boat_charger_map:
                         charger_name = self.boat_charger_map[boat_name]
@@ -509,7 +509,7 @@ class SimulationEngine:
                     required_soc = estimated_energy / boat.battery_capacity
 
                     # Check if boat has enough charge (tolerance for float precision)
-                    if boat.soc >= required_soc - 1e-6:
+                    if boat.soc >= (int(required_soc * 100) / 100):
                         # Disconnect from charger if connected
                         if boat_name in self.boat_charger_map:
                             charger_name = self.boat_charger_map[boat_name]
