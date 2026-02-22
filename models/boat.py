@@ -4,11 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
-HULL_FACTOR = 1
-
-
 class BoatState(Enum):
-    """Possible states for a boat."""
+    """Boat state: idle, charging, or sailing."""
 
     IDLE = "idle"
     CHARGING = "charging"
@@ -18,39 +15,35 @@ class BoatState(Enum):
 @dataclass
 class Boat:
     """
-    Represents an electric boat in the port.
+    Electric boat at the port.
 
     Attributes:
-        name: Name/identifier of the boat
-        motor_power: Motor power in kW
-        weight: Boat weight in kg
-        length: Boat length in meters
-        battery_capacity: Battery capacity in kWh
-        range_speed: Range speed in knots
-        soc: State of charge (0-1, where 1 = 100%)
-        _state: Current state of the boat
+        motor_power: Motor power (kW).
+        weight: Weight (kg).
+        length: Length (m).
+        battery_capacity: Battery capacity (kWh).
+        range_speed: Range speed (knots).
+        soc: State of charge in [0, 1]; default 1.0 (full).
+        name: Identifier; auto-generated as Boat_N if empty.
+        _state: Internal state (BoatState); use .state property.
     """
 
-    motor_power: int  # kW
-    weight: float  # kg
-    length: float  # m
-    battery_capacity: float  # kWh
-    range_speed: float  # knots
-    soc: float = 1.0  # Default fully charged (0-1)
-    name: str = ""  # Will be set in __post_init__ if empty
+    motor_power: int
+    weight: float
+    length: float
+    battery_capacity: float
+    range_speed: float
+    soc: float = 1.0
+    name: str = ""
     _state: BoatState = field(default=BoatState.IDLE, init=False)
-
-    # Class variable to track boat count for default naming
     _boat_count: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self):
-        """Validate boat attributes and set default name if needed."""
-        # Set default name if not provided
+        """Validate attributes and set default name if empty."""
         if not self.name:
             Boat._boat_count = getattr(Boat, "_boat_count", 0) + 1
             self.name = f"Boat_{Boat._boat_count}"
 
-        # Validation
         if self.motor_power <= 0:
             raise ValueError("Motor power must be positive")
         if self.weight <= 0:
@@ -66,27 +59,17 @@ class Boat:
 
     @property
     def k(self) -> float:
-        """
-        Calculate k-factor for cube law: motor_power / range_speed^3.
-
-        Returns:
-            K-factor for power consumption calculations
-        """
-        return self.motor_power / (self.range_speed**3) * HULL_FACTOR
+        """Return k-factor for cube law: motor_power / range_speed^3 (used in trip energy estimates)."""
+        return self.motor_power / (self.range_speed**3)
 
     @property
     def state(self) -> BoatState:
-        """Get the current state of the boat."""
+        """Current boat state."""
         return self._state
 
     @state.setter
     def state(self, new_state: BoatState):
-        """
-        Set the state of the boat.
-
-        Args:
-            new_state: New state for the boat
-        """
+        """Set boat state; new_state must be a BoatState enum."""
         if not isinstance(new_state, BoatState):
             raise ValueError(f"State must be a BoatState enum, got {type(new_state)}")
         self._state = new_state

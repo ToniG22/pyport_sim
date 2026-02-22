@@ -1,16 +1,12 @@
-"""Database manager for storing simulation data."""
+"""Database manager for storing and querying simulation data (SQLite)."""
 
 import sqlite3
-from typing import Optional, List, Tuple
 from contextlib import contextmanager
+from typing import List, Optional, Tuple
 
-# Valid table names for data records
 VALID_TABLES = ("measurements", "forecast", "scheduling")
 
-# Default metrics to initialize with the database
-# Format: (metric_name, unit, data_type)
 DEFAULT_METRICS = (
-    # Power metrics
     ("power_active_consumption", "kW", "float"),
     ("power_active_production", "kW", "float"),
     ("power_active_import", "kW", "float"),
@@ -19,7 +15,6 @@ DEFAULT_METRICS = (
     ("contracted_power", "kW", "float"),
     ("power_active", "kW", "float"),
     ("power_setpoint", "kW", "float"),
-    # Battery/BESS metrics
     ("soc", "%", "float"),
     ("state", "", "str"),
     ("bess_discharge", "kW", "float"),
@@ -27,10 +22,8 @@ DEFAULT_METRICS = (
     ("energy_stored", "kWh", "float"),
     ("bess_available", "kWh", "float"),
     ("bess_capacity", "kWh", "float"),
-    # Boat forecast metrics
     ("boat_required_energy", "kWh", "float"),
     ("boat_available", "", "int"),
-    # Weather metrics
     ("temperature", "°C", "float"),
     ("humidity", "%", "float"),
     ("dew_point", "°C", "float"),
@@ -39,46 +32,47 @@ DEFAULT_METRICS = (
     ("cloud_cover", "%", "float"),
     ("wind_speed", "m/s", "float"),
     ("wind_direction", "°", "float"),
-    # Solar radiation metrics
     ("ghi", "W/m²", "float"),
     ("direct_radiation", "W/m²", "float"),
     ("dhi", "W/m²", "float"),
     ("dni", "W/m²", "float"),
-    # Energy/production metrics
     ("net_balance", "kW", "float"),
 )
 
 
 class DatabaseManager:
-    """Manages SQLite database operations for the simulator."""
+    """
+    Manages SQLite database operations for the simulator.
+
+    Uses in-memory caches for source_id and metric_id to avoid repeated lookups.
+    """
 
     def __init__(self, db_path: str):
         """
-        Initialize database manager.
+        Initialize the database manager.
 
         Args:
-            db_path: Path to SQLite database file
+            db_path: Path to the SQLite database file.
         """
         self.db_path = db_path
         self._connection: Optional[sqlite3.Connection] = None
-        # Cache for source and metric IDs to avoid repeated lookups
         self._source_cache: dict[str, int] = {}
         self._metric_cache: dict[str, int] = {}
 
     def connect(self):
-        """Establish database connection."""
+        """Open a persistent database connection and set row_factory to sqlite3.Row."""
         self._connection = sqlite3.connect(self.db_path)
         self._connection.row_factory = sqlite3.Row
 
     def close(self):
-        """Close database connection."""
+        """Close the persistent database connection if open."""
         if self._connection:
             self._connection.close()
             self._connection = None
 
     @contextmanager
     def get_connection(self):
-        """Context manager for database connection."""
+        """Context manager: yields a connection with foreign keys on; commits on success, rolls back on exception."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -92,11 +86,10 @@ class DatabaseManager:
             conn.close()
 
     def initialize_schema(self):
-        """Create database tables for simulation data."""
+        """Create all tables (source, metric, measurements, forecast, scheduling) and their indexes."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
 
-            # Source table - registry of data sources
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS source (
@@ -107,7 +100,6 @@ class DatabaseManager:
             """
             )
 
-            # Metric table - registry of metrics
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS metric (
@@ -119,7 +111,6 @@ class DatabaseManager:
             """
             )
 
-            # Measurements table - for actual measured/simulated data
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS measurements (
@@ -134,7 +125,6 @@ class DatabaseManager:
             """
             )
 
-            # Create indexes for measurements
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_measurements_timestamp 
@@ -154,7 +144,6 @@ class DatabaseManager:
             """
             )
 
-            # Forecast table - for predicted/forecasted data
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS forecast (
@@ -169,7 +158,6 @@ class DatabaseManager:
             """
             )
 
-            # Create indexes for forecast
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_forecast_timestamp 
@@ -189,7 +177,6 @@ class DatabaseManager:
             """
             )
 
-            # Scheduling table - for scheduled events/commands
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scheduling (
@@ -204,7 +191,6 @@ class DatabaseManager:
             """
             )
 
-            # Create indexes for scheduling
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_scheduling_timestamp 
@@ -227,11 +213,7 @@ class DatabaseManager:
             conn.commit()
 
     def initialize_default_metrics(self):
-        """
-        Initialize the database with default metrics.
-        
-        Inserts all metrics from DEFAULT_METRICS if they don't already exist.
-        """
+        """Insert all DEFAULT_METRICS into the metric table (INSERT OR IGNORE)."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             for metric_name, unit, data_type in DEFAULT_METRICS:
@@ -245,26 +227,25 @@ class DatabaseManager:
             conn.commit()
 
     def _validate_table(self, table: str):
-        """Validate that the table name is allowed."""
+        """Raise ValueError if table is not one of VALID_TABLES."""
         if table not in VALID_TABLES:
             raise ValueError(f"Invalid table '{table}'. Must be one of: {VALID_TABLES}")
 
-    # Unified data record methods (measurements, forecast, scheduling)
     def save_record(
         self, table: str, timestamp: str, source_id: int, metric_id: int, value: str
     ) -> int:
         """
-        Save a single record to the specified table.
+        Insert a single record into the given table.
 
         Args:
-            table: Table name ('measurements', 'forecast', or 'scheduling')
-            timestamp: Timestamp (ISO format UTC string)
-            source_id: Foreign key to source table
-            metric_id: Foreign key to metric table
-            value: Value as string
+            table: One of 'measurements', 'forecast', 'scheduling'.
+            timestamp: ISO-format UTC timestamp string.
+            source_id: Foreign key to source.
+            metric_id: Foreign key to metric.
+            value: Value stored as string.
 
         Returns:
-            The measurement_id of the inserted record
+            The measurement_id of the inserted row.
         """
         self._validate_table(table)
         with self.get_connection() as conn:
@@ -278,15 +259,13 @@ class DatabaseManager:
             )
             return cursor.lastrowid
 
-    def save_records_batch(
-        self, table: str, records: List[Tuple[str, int, int, str]]
-    ):
+    def save_records_batch(self, table: str, records: List[Tuple[str, int, int, str]]):
         """
-        Save multiple records in a single transaction.
+        Insert multiple records in one transaction.
 
         Args:
-            table: Table name ('measurements', 'forecast', or 'scheduling')
-            records: List of tuples (timestamp, source_id, metric_id, value)
+            table: One of 'measurements', 'forecast', 'scheduling'.
+            records: List of (timestamp, source_id, metric_id, value) tuples.
         """
         self._validate_table(table)
         with self.get_connection() as conn:
@@ -308,17 +287,17 @@ class DatabaseManager:
         end_time: str = None,
     ):
         """
-        Retrieve records from the specified table with optional filtering.
+        Return records from the table with optional filters.
 
         Args:
-            table: Table name ('measurements', 'forecast', or 'scheduling')
-            source_id: Filter by source_id (optional)
-            metric_id: Filter by metric_id (optional)
-            start_time: Filter by start timestamp ISO string (optional)
-            end_time: Filter by end timestamp ISO string (optional)
+            table: One of 'measurements', 'forecast', 'scheduling'.
+            source_id: Optional filter by source_id.
+            metric_id: Optional filter by metric_id.
+            start_time: Optional inclusive start timestamp (ISO string).
+            end_time: Optional inclusive end timestamp (ISO string).
 
         Returns:
-            List of records
+            List of rows (sqlite3.Row), ordered by timestamp.
         """
         self._validate_table(table)
         query = f"SELECT * FROM {table} WHERE 1=1"
@@ -347,16 +326,14 @@ class DatabaseManager:
             cursor.execute(query, params)
             return cursor.fetchall()
 
-    def clear_records(
-        self, table: str, source_id: int = None, from_time: str = None
-    ):
+    def clear_records(self, table: str, source_id: int = None, from_time: str = None):
         """
-        Clear records from the specified table.
+        Delete records from the table, optionally by source_id and/or from_time.
 
         Args:
-            table: Table name ('measurements', 'forecast', or 'scheduling')
-            source_id: Optional source_id filter (clears only this source if provided)
-            from_time: Optional timestamp filter (clears only records from this time onwards)
+            table: One of 'measurements', 'forecast', 'scheduling'.
+            source_id: If set, delete only records for this source.
+            from_time: If set, delete only records with timestamp >= from_time (ISO string).
         """
         self._validate_table(table)
         with self.get_connection() as conn:
@@ -367,9 +344,7 @@ class DatabaseManager:
                     (source_id, from_time),
                 )
             elif source_id is not None:
-                cursor.execute(
-                    f"DELETE FROM {table} WHERE source_id = ?", (source_id,)
-                )
+                cursor.execute(f"DELETE FROM {table} WHERE source_id = ?", (source_id,))
             elif from_time is not None:
                 cursor.execute(
                     f"DELETE FROM {table} WHERE timestamp >= ?", (from_time,)
@@ -377,17 +352,16 @@ class DatabaseManager:
             else:
                 cursor.execute(f"DELETE FROM {table}")
 
-    # Source table methods
     def save_source(self, source_name: str, source_type: str) -> int:
         """
-        Save a source to the database.
+        Insert a source row.
 
         Args:
-            source_name: Name of the source (e.g., 'boat_001', 'charger_01')
-            source_type: Type of source (e.g., 'boat', 'charger', 'battery')
+            source_name: Unique name (e.g. 'boat_001', 'charger_01').
+            source_type: Type (e.g. 'boat', 'charger', 'battery').
 
         Returns:
-            The source_id of the inserted record
+            The inserted source_id.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -402,66 +376,54 @@ class DatabaseManager:
 
     def get_source(self, source_id: int = None, source_name: str = None):
         """
-        Retrieve a source by ID or name.
-
-        Args:
-            source_id: Source ID (optional)
-            source_name: Source name (optional)
+        Return one source by source_id or source_name; at least one must be given.
 
         Returns:
-            Source record or None
+            sqlite3.Row or None if not found.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             if source_id is not None:
                 cursor.execute("SELECT * FROM source WHERE source_id = ?", (source_id,))
             elif source_name is not None:
-                cursor.execute("SELECT * FROM source WHERE source_name = ?", (source_name,))
+                cursor.execute(
+                    "SELECT * FROM source WHERE source_name = ?", (source_name,)
+                )
             else:
                 return None
             return cursor.fetchone()
 
     def get_all_sources(self, source_type: str = None):
         """
-        Retrieve all sources, optionally filtered by type.
-
-        Args:
-            source_type: Filter by source type (optional)
-
-        Returns:
-            List of source records
+        Return all source rows, optionally filtered by source_type.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             if source_type:
-                cursor.execute("SELECT * FROM source WHERE source_type = ?", (source_type,))
+                cursor.execute(
+                    "SELECT * FROM source WHERE source_type = ?", (source_type,)
+                )
             else:
                 cursor.execute("SELECT * FROM source")
             return cursor.fetchall()
 
     def delete_source(self, source_id: int):
-        """
-        Delete a source by ID.
-
-        Args:
-            source_id: Source ID to delete
-        """
+        """Delete the source row with the given source_id."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM source WHERE source_id = ?", (source_id,))
 
-    # Metric table methods
     def save_metric(self, metric_name: str, unit: str, data_type: str) -> int:
         """
-        Save a metric to the database.
+        Insert a metric row.
 
         Args:
-            metric_name: Name of the metric (e.g., 'power', 'soc', 'temperature')
-            unit: Unit of measurement (e.g., 'kW', '%', 'C')
-            data_type: Data type (e.g., 'float', 'int', 'bool')
+            metric_name: Unique name (e.g. 'power', 'soc', 'temperature').
+            unit: Unit string (e.g. 'kW', '%', '°C').
+            data_type: One of 'float', 'int', 'str', etc.
 
         Returns:
-            The metric_id of the inserted record
+            The inserted metric_id.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -476,35 +438,25 @@ class DatabaseManager:
 
     def get_metric(self, metric_id: int = None, metric_name: str = None):
         """
-        Retrieve a metric by ID or name.
-
-        Args:
-            metric_id: Metric ID (optional)
-            metric_name: Metric name (optional)
+        Return one metric by metric_id or metric_name; at least one must be given.
 
         Returns:
-            Metric record or None
+            sqlite3.Row or None if not found.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             if metric_id is not None:
                 cursor.execute("SELECT * FROM metric WHERE metric_id = ?", (metric_id,))
             elif metric_name is not None:
-                cursor.execute("SELECT * FROM metric WHERE metric_name = ?", (metric_name,))
+                cursor.execute(
+                    "SELECT * FROM metric WHERE metric_name = ?", (metric_name,)
+                )
             else:
                 return None
             return cursor.fetchone()
 
     def get_all_metrics(self, data_type: str = None):
-        """
-        Retrieve all metrics, optionally filtered by data type.
-
-        Args:
-            data_type: Filter by data type (optional)
-
-        Returns:
-            List of metric records
-        """
+        """Return all metric rows, optionally filtered by data_type."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             if data_type:
@@ -514,42 +466,32 @@ class DatabaseManager:
             return cursor.fetchall()
 
     def delete_metric(self, metric_id: int):
-        """
-        Delete a metric by ID.
-
-        Args:
-            metric_id: Metric ID to delete
-        """
+        """Delete the metric row with the given metric_id."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM metric WHERE metric_id = ?", (metric_id,))
 
-    # Helper methods for ID resolution
     def get_or_create_source(self, source_name: str, source_type: str) -> int:
         """
-        Get source_id for a source, creating it if it doesn't exist.
-        
-        Uses caching to avoid repeated database lookups.
+        Return source_id for the given source; insert the source if it does not exist.
+        Results are cached to avoid repeated lookups.
 
         Args:
-            source_name: Name of the source (e.g., 'port', 'SeaBreeze', 'FastCharger_A')
-            source_type: Type of source (e.g., 'port', 'boat', 'charger', 'pv', 'bess', 'weather')
+            source_name: Unique source name (e.g. 'port', 'SeaBreeze', 'FastCharger_A').
+            source_type: Type (e.g. 'port', 'boat', 'charger', 'pv', 'bess', 'weather').
 
         Returns:
-            The source_id
+            The source_id.
         """
-        # Check cache first
         if source_name in self._source_cache:
             return self._source_cache[source_name]
-        
-        # Try to get existing source
+
         source = self.get_source(source_name=source_name)
         if source:
             source_id = source["source_id"]
             self._source_cache[source_name] = source_id
             return source_id
-        
-        # Create new source
+
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -560,40 +502,38 @@ class DatabaseManager:
                 (source_name, source_type),
             )
             source_id = cursor.lastrowid
-        
+
         self._source_cache[source_name] = source_id
         return source_id
 
     def get_metric_id(self, metric_name: str) -> int:
         """
-        Get metric_id for a metric by name.
-        
-        Uses caching to avoid repeated database lookups.
-        Assumes metric already exists (from DEFAULT_METRICS or manual creation).
+        Return metric_id for the given metric name. Uses caching.
+        The metric must already exist (e.g. from DEFAULT_METRICS or manual creation).
 
         Args:
-            metric_name: Name of the metric (e.g., 'power_active', 'soc')
+            metric_name: Metric name (e.g. 'power_active', 'soc').
 
         Returns:
-            The metric_id
+            The metric_id.
 
         Raises:
-            ValueError: If metric doesn't exist
+            ValueError: If no metric with that name exists.
         """
-        # Check cache first
         if metric_name in self._metric_cache:
             return self._metric_cache[metric_name]
-        
-        # Get existing metric
+
         metric = self.get_metric(metric_name=metric_name)
         if metric:
             metric_id = metric["metric_id"]
             self._metric_cache[metric_name] = metric_id
             return metric_id
-        
-        raise ValueError(f"Metric '{metric_name}' not found. Ensure it's in DEFAULT_METRICS or created manually.")
+
+        raise ValueError(
+            f"Metric '{metric_name}' not found. Ensure it's in DEFAULT_METRICS or created manually."
+        )
 
     def clear_caches(self):
-        """Clear the source and metric ID caches."""
+        """Clear in-memory source_id and metric_id caches."""
         self._source_cache.clear()
         self._metric_cache.clear()

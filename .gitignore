@@ -181,3 +181,4 @@ pyrightconfig.json
 output/
 
 comparison_results/
+.cursor/

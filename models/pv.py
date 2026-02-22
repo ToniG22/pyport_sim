@@ -1,12 +1,12 @@
+"""PV system model using pvlib (POA irradiance, Sandia cell temperature, PVWatts DC)."""
+
 from dataclasses import dataclass
 import pvlib
 
-# Constants for DC power model
-REFERENCE_IRRADIANCE = 1000.0  # W/m² STC (standard test conditions)
-REFERENCE_TEMP = 25.0  # °C STC (standard test conditions)
-TEMP_COEFF_PDC = -0.004  # 1/°C, typical for crystalline silicon (PVWatts)
+REFERENCE_IRRADIANCE = 1000.0
+REFERENCE_TEMP = 25.0
+TEMP_COEFF_PDC = -0.004
 
-# Sandia temperature model parameters for open rack glass/polymer (PVWatts)
 SAPM_TEMP_PARAMS = pvlib.temperature.TEMPERATURE_MODEL_PARAMETERS["sapm"][
     "open_rack_glass_polymer"
 ]
@@ -14,8 +14,21 @@ SAPM_TEMP_PARAMS = pvlib.temperature.TEMPERATURE_MODEL_PARAMETERS["sapm"][
 
 @dataclass
 class PV:
+    """
+    PV system with fixed tilt/azimuth; production from GHI/DNI/DHI and cell temperature.
+
+    Attributes:
+        name: System name.
+        capacity: DC capacity at STC (kW).
+        tilt: Panel tilt (degrees); default 30.
+        azimuth: Panel azimuth (degrees); default 180.
+        latitude: Site latitude.
+        longitude: Site longitude.
+        current_production: Last computed production (kW).
+    """
+
     name: str
-    capacity: float  # kW DC at STC (pdc0)
+    capacity: float
     tilt: float = 30.0
     azimuth: float = 180.0
     latitude: float = 0.0
@@ -23,6 +36,7 @@ class PV:
     current_production: float = 0.0
 
     def __post_init__(self):
+        """Validate capacity, tilt, azimuth, and coordinates."""
         if self.capacity <= 0:
             raise ValueError("Capacity must be positive")
         if not 0 <= self.tilt <= 90:
@@ -41,9 +55,22 @@ class PV:
         dhi: float,
         temperature: float,
         timestamp,
-        wind_speed: float = 1.0,  # m/s (assumed to be 1 m/s)
+        wind_speed: float = 1.0,
     ) -> float:
+        """
+        Compute DC power (kW) at timestamp using POA irradiance, Sandia cell temperature, PVWatts DC.
 
+        Args:
+            ghi: Global horizontal irradiance (W/m²).
+            dni: Direct normal irradiance (W/m²).
+            dhi: Diffuse horizontal irradiance (W/m²).
+            temperature: Air temperature (°C).
+            timestamp: Time for solar position.
+            wind_speed: Wind speed (m/s) for cell temperature; default 1.0.
+
+        Returns:
+            DC power in kW; 0 if sun below horizon. Also sets current_production.
+        """
         solpos = pvlib.solarposition.get_solarposition(
             timestamp, self.latitude, self.longitude
         )
@@ -63,7 +90,6 @@ class PV:
             albedo=0.2,
         )["poa_global"]
 
-        # Sandia cell temperature model
         cell_temperature = pvlib.temperature.sapm_cell(
             poa_global=poa,
             temp_air=temperature,

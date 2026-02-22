@@ -1,4 +1,8 @@
-"""Models for the electric port simulator."""
+"""
+Domain models for the electric port simulator.
+
+Exposes Port, Boat, BoatState, Charger, ChargerState, Trip, TripPoint, PV, BESS, BESSControlStrategy.
+"""
 
 from .port import Port
 from .boat import Boat, BoatState
@@ -19,4 +23,3 @@ __all__ = [
     "BESS",
     "BESSControlStrategy",
 ]
-

@@ -1,23 +1,24 @@
-"""Weather data fetcher using Open-Meteo API."""
+"""Weather data via the Open-Meteo forecast and historical APIs."""
 
-import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+import requests
+
 
 class OpenMeteoClient:
-    """Client for fetching weather data from Open-Meteo API."""
+    """Fetches hourly weather and irradiance from Open-Meteo for a fixed (lat, lon)."""
 
     FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
     HISTORICAL_URL = "https://archive-api.open-meteo.com/v1/archive"
 
     def __init__(self, latitude: float, longitude: float):
         """
-        Initialize Open-Meteo client.
+        Initialize the client for a single location.
 
         Args:
-            latitude: Location latitude
-            longitude: Location longitude
+            latitude: Latitude in degrees.
+            longitude: Longitude in degrees.
         """
         self.latitude = latitude
         self.longitude = longitude
@@ -26,23 +27,18 @@ class OpenMeteoClient:
         self, start_date: datetime, days: int = 7
     ) -> Optional[Dict[str, List]]:
         """
-        Fetch weather data from Open-Meteo (forecast or historical based on date).
+        Fetch hourly weather for the date range; uses historical API for past dates, forecast API otherwise.
 
         Args:
-            start_date: Start date for weather data
-            days: Number of days to fetch (max 7 for free tier forecast)
+            start_date: Start date (timezone-aware or naive).
+            days: Number of days to fetch (forecast free tier typically limited to 7).
 
         Returns:
-            Dictionary with weather data, or None on error
+            Parsed dict with 'timestamps' and metric lists, or None on request error.
         """
-        # Calculate end date
         end_date = start_date + timedelta(days=days)
-
-        # Format dates as strings
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
-
-        # Determine if we need historical or forecast API
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         is_historical = start_date.replace(tzinfo=None) < today
 
@@ -51,8 +47,10 @@ class OpenMeteoClient:
         else:
             return self._fetch_forecast(start_str, end_str)
 
-    def _fetch_forecast(self, start_str: str, end_str: str) -> Optional[Dict[str, List]]:
-        """Fetch from forecast API (for current/future dates)."""
+    def _fetch_forecast(
+        self, start_str: str, end_str: str
+    ) -> Optional[Dict[str, List]]:
+        """Request hourly data from the forecast API for current/future dates."""
         params = {
             "latitude": self.latitude,
             "longitude": self.longitude,
@@ -67,10 +65,10 @@ class OpenMeteoClient:
                 "cloud_cover",
                 "wind_speed_10m",
                 "wind_direction_10m",
-                "shortwave_radiation",  # GHI equivalent
-                "direct_radiation",  # DNI equivalent
-                "diffuse_radiation",  # DHI equivalent
-                "direct_normal_irradiance",  # Actual DNI
+                "shortwave_radiation",
+                "direct_radiation",
+                "diffuse_radiation",
+                "direct_normal_irradiance",
             ],
             "timezone": "UTC",
         }
@@ -85,8 +83,10 @@ class OpenMeteoClient:
             print(f"Error fetching forecast data: {e}")
             return None
 
-    def _fetch_historical(self, start_str: str, end_str: str) -> Optional[Dict[str, List]]:
-        """Fetch from historical/archive API (for past dates)."""
+    def _fetch_historical(
+        self, start_str: str, end_str: str
+    ) -> Optional[Dict[str, List]]:
+        """Request hourly data from the archive API for past dates."""
         params = {
             "latitude": self.latitude,
             "longitude": self.longitude,
@@ -101,16 +101,16 @@ class OpenMeteoClient:
                 "cloud_cover",
                 "wind_speed_10m",
                 "wind_direction_10m",
-                "shortwave_radiation",  # GHI equivalent
-                "direct_radiation",  # DNI equivalent
-                "diffuse_radiation",  # DHI equivalent
-                "direct_normal_irradiance",  # Actual DNI
+                "shortwave_radiation",
+                "direct_radiation",
+                "diffuse_radiation",
+                "direct_normal_irradiance",
             ],
             "timezone": "UTC",
         }
 
         try:
-            print(f"  (Using historical weather API for past date)")
+            print("Using historical weather API for past dates")
             response = requests.get(self.HISTORICAL_URL, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
@@ -122,29 +122,23 @@ class OpenMeteoClient:
 
     def _parse_response(self, data: dict) -> Dict[str, List]:
         """
-        Parse Open-Meteo API response.
+        Convert Open-Meteo hourly payload into a dict of timestamps and metric-name lists.
 
         Args:
-            data: Raw API response
+            data: Raw JSON response (must contain "hourly" with "time" and metric arrays).
 
         Returns:
-            Parsed weather data with timestamps and values
+            Dict with "timestamps" (list of datetime) and keys like "temperature", "ghi", "dni", "dhi".
         """
         if "hourly" not in data:
             return {}
 
         hourly = data["hourly"]
         timestamps = hourly.get("time", [])
-
-        # Parse timestamps
         parsed_timestamps = [
             datetime.strptime(ts, "%Y-%m-%dT%H:%M") for ts in timestamps
         ]
-
-        # Extract all available metrics
         parsed_data = {"timestamps": parsed_timestamps}
-
-        # Map API fields to our metric names
         metric_mapping = {
             "temperature_2m": "temperature",
             "relative_humidity_2m": "humidity",
@@ -154,10 +148,10 @@ class OpenMeteoClient:
             "cloud_cover": "cloud_cover",
             "wind_speed_10m": "wind_speed",
             "wind_direction_10m": "wind_direction",
-            "shortwave_radiation": "ghi",  # Global Horizontal Irradiance
+            "shortwave_radiation": "ghi",
             "direct_radiation": "direct_radiation",
-            "diffuse_radiation": "dhi",  # Diffuse Horizontal Irradiance
-            "direct_normal_irradiance": "dni",  # Direct Normal Irradiance
+            "diffuse_radiation": "dhi",
+            "direct_normal_irradiance": "dni",
         }
 
         for api_field, metric_name in metric_mapping.items():
@@ -168,28 +162,24 @@ class OpenMeteoClient:
 
     def get_current_conditions(self, current_time: datetime) -> Optional[Dict]:
         """
-        Get weather conditions for a specific time from forecast data.
+        Return conditions for the hour closest to current_time (fetches 1-day forecast).
 
         Args:
-            current_time: Time to get conditions for
+            current_time: Time to resolve (timezone-aware or naive).
 
         Returns:
-            Dictionary with weather conditions, or None if not available
+            Dict with "timestamp" and one value per metric for that hour, or None if fetch fails.
         """
-        # Fetch forecast if not cached
         forecast = self.fetch_forecast(current_time, days=1)
 
         if not forecast or "timestamps" not in forecast:
             return None
 
-        # Find closest timestamp
         timestamps = forecast["timestamps"]
         closest_idx = min(
             range(len(timestamps)),
             key=lambda i: abs((timestamps[i] - current_time).total_seconds()),
         )
-
-        # Extract conditions for that timestamp
         conditions = {"timestamp": timestamps[closest_idx]}
 
         for key, values in forecast.items():
@@ -200,4 +190,3 @@ class OpenMeteoClient:
 
     def __repr__(self) -> str:
         return f"OpenMeteoClient(lat={self.latitude}, lon={self.longitude})"
-

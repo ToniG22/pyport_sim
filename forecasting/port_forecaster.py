@@ -1,4 +1,4 @@
-"""Port energy production and boat availability forecasting."""
+"""Port PV production and boat availability forecasting for a single day."""
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -10,20 +10,26 @@ from models import Boat, Port, Trip
 
 @dataclass
 class EnergyForecast:
-    """Forecast for a single timestep."""
+    """
+    Forecast for one timestep.
+
+    Attributes:
+        timestamp: Forecast time.
+        power_active_production_kw_by_source: PV power (kW) per source name; port total is separate.
+        power_active_production_kw: Total port PV power (kW).
+        boat_required_energy_kwh: Energy needed (kWh) until next departure, per boat.
+        boat_available: Per-boat charging availability: 1 = available, 0 = not available.
+    """
 
     timestamp: datetime
-    # PV production in kW: per source and port sum
     power_active_production_kw_by_source: Dict[str, float]
     power_active_production_kw: float
-    # Boat energy need until next departure (kWh)
     boat_required_energy_kwh: Dict[str, float]
-    # Connectivity to charge: 0 = not available, 1 = available
     boat_available: Dict[str, int]
 
 
 class PortForecaster:
-    """Forecast PV production and boat availability for the port."""
+    """Generates daily PV and boat-availability forecasts for a port."""
 
     def __init__(
         self,
@@ -32,31 +38,35 @@ class PortForecaster:
         timestep_seconds: int = 900,
         trip_schedule: tuple = ((9, 0), (14, 1)),
     ):
+        """
+        Initialize the forecaster for a port.
+
+        Args:
+            port: Port model (PV systems and boats).
+            db_manager: Database manager for weather forecasts and saving results.
+            timestep_seconds: Simulation timestep in seconds.
+            trip_schedule: Daily departure times as (hour_utc, slot_index) tuples.
+        """
         self.port = port
         self.db_manager = db_manager
         self.timestep_seconds = timestep_seconds
-        # (hour_utc, slot_index) per day
         self.trip_schedule = trip_schedule
 
     def generate_daily_forecast(
         self, forecast_date: datetime, trip_assignments: Dict[str, List[Trip]]
     ) -> List[EnergyForecast]:
         """
-        Generate 24-hour forecast for the port.
+        Build one EnergyForecast per timestep for the given date.
 
-        Forecasted variables:
-        - power_active_production (kW) per PV and port sum
-        - boat_required_energy (kWh) until next departure
-        - boat_available (0 or 1) per boat
+        Uses weather from DB (forecast table), PV models, and trip_assignments to produce
+        power_active_production (per source and port total), boat_required_energy, and boat_available.
         """
         forecasts = []
         timesteps_per_day = int(24 * 3600 / self.timestep_seconds)
         weather_forecasts = self._get_weather_forecasts(forecast_date)
 
         for step in range(timesteps_per_day):
-            timestamp = forecast_date + timedelta(
-                seconds=step * self.timestep_seconds
-            )
+            timestamp = forecast_date + timedelta(seconds=step * self.timestep_seconds)
 
             by_source, total_kw = self._forecast_power_active_production(
                 timestamp, weather_forecasts
@@ -64,9 +74,7 @@ class PortForecaster:
             boat_required_energy = self._forecast_boat_required_energy(
                 timestamp, trip_assignments
             )
-            boat_available = self._forecast_boat_available(
-                timestamp, trip_assignments
-            )
+            boat_available = self._forecast_boat_available(timestamp, trip_assignments)
 
             forecast = EnergyForecast(
                 timestamp=timestamp,
@@ -82,9 +90,7 @@ class PortForecaster:
     def _forecast_power_active_production(
         self, timestamp: datetime, weather_forecasts: Dict[str, Dict[str, float]]
     ) -> tuple:
-        """
-        Forecast PV power production at timestamp (kW per source and total).
-        """
+        """Return (dict of PV source name -> kW, total port kW) at timestamp using weather_forecasts."""
         by_source: Dict[str, float] = {}
         total_kw = 0.0
 
@@ -112,7 +118,7 @@ class PortForecaster:
     def _forecast_boat_required_energy(
         self, timestamp: datetime, trip_assignments: Dict[str, List[Trip]]
     ) -> Dict[str, float]:
-        """Boat energy need (kWh) until next departure deadline."""
+        """Return per-boat energy (kWh) required until the next departure for each boat."""
         out: Dict[str, float] = {}
         for boat in self.port.boats:
             trips = trip_assignments.get(boat.name, [])
@@ -124,7 +130,7 @@ class PortForecaster:
         return out
 
     def _departure_times(self, timestamp: datetime) -> List[datetime]:
-        """Departure times for the day of timestamp from trip_schedule."""
+        """Return departure datetimes for the calendar day of timestamp (from trip_schedule)."""
         return [
             timestamp.replace(hour=hour, minute=0, second=0, microsecond=0)
             for hour, _ in self.trip_schedule
@@ -133,7 +139,7 @@ class PortForecaster:
     def _next_departure_trip(
         self, timestamp: datetime, trips: List[Trip]
     ) -> Optional[Trip]:
-        """Next trip (by departure time) after timestamp; None if no more trips."""
+        """Return the next trip (by departure time) after timestamp, or None if none left."""
         if not trips:
             return None
         start_times = self._departure_times(timestamp)
@@ -146,7 +152,7 @@ class PortForecaster:
             if t_trip0_end <= timestamp < start_times[1]:
                 return trips[1]
             if timestamp >= start_times[1]:
-                return None  # after last departure
+                return None
         else:
             dur0 = trips[0].duration
             t_trip0_end = start_times[0] + timedelta(seconds=dur0)
@@ -157,7 +163,7 @@ class PortForecaster:
     def _forecast_boat_available(
         self, timestamp: datetime, trip_assignments: Dict[str, List[Trip]]
     ) -> Dict[str, int]:
-        """Boat availability to charge: 1 = available, 0 = not available."""
+        """Return per-boat availability to charge: 1 = available, 0 = not available."""
         out: Dict[str, int] = {}
         for boat in self.port.boats:
             trips = trip_assignments.get(boat.name, [])
@@ -167,7 +173,7 @@ class PortForecaster:
         return out
 
     def _is_boat_sailing(self, timestamp: datetime, trips: List[Trip]) -> bool:
-        """True if boat is sailing at timestamp (within a trip)."""
+        """Return True if the boat is currently within a trip at timestamp."""
         if not trips:
             return False
         start_times = self._departure_times(timestamp)
@@ -182,7 +188,7 @@ class PortForecaster:
     def _in_charging_window(
         self, timestamp: datetime, trips: List[Trip], _boat: Boat
     ) -> bool:
-        """True if timestamp is inside a charging availability window."""
+        """Return True if timestamp falls in a window when the boat can charge (between trips)."""
         if not trips:
             return False
         start_times = self._departure_times(timestamp)
@@ -205,19 +211,13 @@ class PortForecaster:
     def _get_weather_forecasts(
         self, forecast_date: datetime
     ) -> Dict[str, Dict[str, float]]:
-        """
-        Get weather forecasts for a specific date from database.
-        """
+        """Load hourly ghi, dni, dhi, temperature from DB forecast table for the given date (openmeteo source)."""
         weather_data = {}
 
         start_str = forecast_date.strftime("%Y-%m-%d 00:00:00")
-        end_str = (forecast_date + timedelta(days=1)).strftime(
-            "%Y-%m-%d 00:00:00"
-        )
+        end_str = (forecast_date + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
 
-        openmeteo_src = self.db_manager.get_or_create_source(
-            "openmeteo", "weather"
-        )
+        openmeteo_src = self.db_manager.get_or_create_source("openmeteo", "weather")
         metrics = ["ghi", "dni", "dhi", "temperature"]
 
         for metric in metrics:
@@ -239,27 +239,26 @@ class PortForecaster:
         return weather_data
 
     def save_forecasts_to_db(
-        self, forecasts: List[EnergyForecast], forecast_type: str = "port_energy"  # pylint: disable=unused-argument
+        self,
+        forecasts: List[EnergyForecast],
+        _forecast_type: str = "port_energy",
     ) -> None:
-        """Save forecasts to DB: power_active_production (per PV + port), boat_required_energy, boat_available."""
+        """Write forecasts to the forecast table: power_active_production (per PV source and port), boat_required_energy, boat_available."""
         forecast_data = []
         port_src = self.db_manager.get_or_create_source(self.port.name, "port")
         power_met = self.db_manager.get_metric_id("power_active_production")
-        boat_required_met = self.db_manager.get_metric_id(
-            "boat_required_energy"
-        )
+        boat_required_met = self.db_manager.get_metric_id("boat_required_energy")
         boat_available_met = self.db_manager.get_metric_id("boat_available")
 
         for forecast in forecasts:
             ts_str = forecast.timestamp.strftime("%Y-%m-%d %H:%M:%S")
 
-            for source_name, kw in forecast.power_active_production_kw_by_source.items():
-                src = self.db_manager.get_or_create_source(
-                    source_name, "pv"
-                )
-                forecast_data.append(
-                    (ts_str, src, power_met, str(kw))
-                )
+            for (
+                source_name,
+                kw,
+            ) in forecast.power_active_production_kw_by_source.items():
+                src = self.db_manager.get_or_create_source(source_name, "pv")
+                forecast_data.append((ts_str, src, power_met, str(kw)))
             forecast_data.append(
                 (
                     ts_str,
@@ -270,26 +269,18 @@ class PortForecaster:
             )
 
             for boat_name, kwh in forecast.boat_required_energy_kwh.items():
-                boat_src = self.db_manager.get_or_create_source(
-                    boat_name, "boat"
-                )
-                forecast_data.append(
-                    (ts_str, boat_src, boat_required_met, str(kwh))
-                )
+                boat_src = self.db_manager.get_or_create_source(boat_name, "boat")
+                forecast_data.append((ts_str, boat_src, boat_required_met, str(kwh)))
 
             for boat_name, avail in forecast.boat_available.items():
-                boat_src = self.db_manager.get_or_create_source(
-                    boat_name, "boat"
-                )
-                forecast_data.append(
-                    (ts_str, boat_src, boat_available_met, str(avail))
-                )
+                boat_src = self.db_manager.get_or_create_source(boat_name, "boat")
+                forecast_data.append((ts_str, boat_src, boat_available_met, str(avail)))
 
         if forecast_data:
             self.db_manager.save_records_batch("forecast", forecast_data)
 
     def print_forecast_summary(self, forecasts: List[EnergyForecast]) -> None:
-        """Print a short summary of the forecasts."""
+        """Print a one-line summary: total PV production (kWh) and peak power (kW) with time."""
         if not forecasts:
             print("  No forecasts to display")
             return
