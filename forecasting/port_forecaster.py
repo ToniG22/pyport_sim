@@ -241,7 +241,6 @@ class PortForecaster:
     def save_forecasts_to_db(
         self,
         forecasts: List[EnergyForecast],
-        _forecast_type: str = "port_energy",
     ) -> None:
         """Write forecasts to the forecast table: power_active_production (per PV source and port), boat_required_energy, boat_available."""
         forecast_data = []

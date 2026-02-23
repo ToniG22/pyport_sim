@@ -15,9 +15,9 @@ Performance-tuned for 10+ vessel fleets:
 """
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from pyscipopt import Model, quicksum
 
@@ -28,6 +28,8 @@ from models import Port
 
 @dataclass
 class BaseOptimizationResult:
+    """Result of a daily optimization run."""
+
     status: str
     charger_schedules: Dict[str, List[Tuple[datetime, float]]]
     boat_schedules: Dict[str, List[Tuple[datetime, float]]]
@@ -37,7 +39,7 @@ class BaseOptimizationResult:
 
 
 class BaseOptimizer:
-    """Minimize cost. Single constraint: grid import <= contracted_power."""
+    """Minimize cost with grid import constrained to be <= contracted_power."""
 
     def __init__(
         self,
@@ -66,10 +68,6 @@ class BaseOptimizer:
 
         self._boat_battery_cap = {b.name: b.battery_capacity for b in self.port.boats}
 
-    # ------------------------------------------------------------------ #
-    #  Public entry point                                                  #
-    # ------------------------------------------------------------------ #
-
     def optimize_daily_schedule(
         self,
         forecast_date: datetime,
@@ -82,17 +80,12 @@ class BaseOptimizer:
         model = Model("base_optimizer")
         model.hideOutput()
 
-        # --- Solver tuning for large fleets ---
         model.setParam("limits/time", self.time_limit_seconds)
         model.setParam("limits/gap", self.mip_gap)
-        # Emphasise finding feasible solutions fast
-        # model.setParam("heuristics/emphasis", "aggressive")
-        # model.setParam("separating/maxrounds", 5)  # Limit cut rounds at root
 
         trip_events = self._extract_trip_events(energy_forecasts)
         print("TRIP EVENTS", trip_events)
 
-        # Lookups
         boat_objects = {b.name: b for b in self.port.boats}
         charger_objects = {c.name: c for c in self.port.chargers}
         charger_to_boat = {
@@ -101,18 +94,15 @@ class BaseOptimizer:
         }
         boat_list = list(self.boat_charger_assignments.keys())
 
-        # --- Decision variables ---
         grid_import = self._add_grid_import_vars(model, timesteps)
         charger_power = self._add_charger_power_vars(model, timesteps)
 
-        # --- PV (parameter) + BESS (variables) + export (slack) ---
         pv_forecast = self._get_pv_forecast(energy_forecasts, timesteps)
         pv_export = self._add_export_vars(model, timesteps)
         bess_charge, bess_discharge, bess_soc = self._add_bess_variables(
             model, timesteps
         )
 
-        # --- Power balance (equality with export slack — tighter LP) ---
         self._add_power_balance_constraints(
             model,
             timesteps,
@@ -124,25 +114,20 @@ class BaseOptimizer:
             pv_export,
         )
 
-        # --- BESS SOC dynamics ---
         self._add_bess_soc_dynamics(
             model, timesteps, bess_charge, bess_discharge, bess_soc
         )
 
-        # --- Departure / at-sea variables ---
         departure_ctx = self._add_departure_variables(
             model, T, timesteps, trip_events, boat_list, forecast_date
         )
 
-        # --- Aggregate boat_away (compact no-charge linking) ---
         boat_away = self._add_boat_away_variables(
             model, timesteps, trip_events, departure_ctx["at_sea"]
         )
 
-        # --- Return-drain (explicit vars for tighter LP bounds) ---
         drain_at = self._add_drain_variables(model, T, trip_events, departure_ctx)
 
-        # --- SOC dynamics ---
         soc = self._add_soc_variables_and_dynamics(
             model,
             timesteps,
@@ -155,13 +140,10 @@ class BaseOptimizer:
             drain_at,
         )
 
-        # --- SOC >= energy_req at departure (tight big-M) ---
         self._add_departure_soc_constraints(model, T, trip_events, soc, departure_ctx)
 
-        # --- Symmetry breaking (strengthened) ---
         self._add_symmetry_breaking(model, trip_events, boat_list, departure_ctx)
 
-        # --- Tariffs & objective ---
         tariff_price = self._compute_tariff_prices(forecast_date, timesteps)
 
         self._set_objective(
@@ -175,21 +157,15 @@ class BaseOptimizer:
             bess_soc,
         )
 
-        # --- MIP warm-start: greedy on-time solution ---
-        # self._add_warm_start(model, trip_events, departure_ctx)
-
-        # --- Solve ---
         model.optimize()
         status = model.getStatus()
         if status not in ("optimal", "bestsollimit", "timelimit"):
-            # Accept any status that produced at least one feasible solution
             if model.getNSols() == 0:
                 raise RuntimeError(f"SCIP failed ({status}), no feasible solution")
             print(
                 f"     Warning: solver status '{status}' but using best solution found"
             )
 
-        # --- Post-processing ---
         self._log_departure_decisions(model, forecast_date, trip_events, departure_ctx)
         self._log_bess_summary(model, timesteps, bess_charge, bess_discharge, bess_soc)
         self._log_pv_summary(model, timesteps, pv_forecast, pv_export)
@@ -210,10 +186,6 @@ class BaseOptimizer:
 
         return result
 
-    # ------------------------------------------------------------------ #
-    #  Variable & constraint builders                                      #
-    # ------------------------------------------------------------------ #
-
     def _add_grid_import_vars(self, model, timesteps):
         return {
             t: model.addVar(lb=0, ub=self.port.contracted_power, name=f"grid_{t}")
@@ -231,19 +203,11 @@ class BaseOptimizer:
             }
         return charger_power
 
-    # ------------------------------------------------------------------ #
-    #  PV, BESS, and export variables                                      #
-    # ------------------------------------------------------------------ #
-
     def _get_pv_forecast(self, energy_forecasts, timesteps):
         return {t: energy_forecasts[t].power_active_production_kw for t in timesteps}
 
     def _add_export_vars(self, model, timesteps):
-        """Slack variable for excess power (PV curtailment / grid export).
-
-        Keeping this as an explicit variable gives an equality power-balance
-        constraint, which produces a tighter LP relaxation than an inequality.
-        """
+        """Slack variable for excess power (PV curtailment / grid export)."""
         return {t: model.addVar(lb=0, name=f"export_{t}") for t in timesteps}
 
     def _add_bess_variables(self, model, timesteps):
@@ -299,10 +263,6 @@ class BaseOptimizer:
                     name=f"bess_soc_dyn_{bess.name}_{t}",
                 )
 
-    # ------------------------------------------------------------------ #
-    #  Power balance (equality — tighter LP than inequality)               #
-    # ------------------------------------------------------------------ #
-
     def _add_power_balance_constraints(
         self,
         model,
@@ -314,12 +274,7 @@ class BaseOptimizer:
         bess_discharge,
         pv_export,
     ):
-        """
-        Power balance at each timestep (equality for tight LP relaxation):
-
-            grid_import + pv_production + Σ bess_discharge
-                = Σ charger_power + Σ bess_charge + pv_export
-        """
+        """Enforce power balance at each timestep as an equality."""
         for t in timesteps:
             supply = grid_import[t] + pv_forecast[t]
             if self.port.bess_systems:
@@ -336,27 +291,16 @@ class BaseOptimizer:
 
             model.addCons(supply == demand, name=f"power_balance_{t}")
 
-    # ------------------------------------------------------------------ #
-    #  Departure / at-sea with SOS1 + branching priorities                 #
-    # ------------------------------------------------------------------ #
-
     def _add_departure_variables(
         self,
         model,
         T,
-        timesteps,
+        _timesteps,
         trip_events,
-        boat_list,
-        forecast_date,   # <-- REQUIRED for correct cutoff
+        _boat_list,
+        forecast_date,
     ):
-        """
-        Create depart_at, did_depart, fully_ready, at_sea variables.
-
-        Fixes:
-        ✅ Departure cutoff enforced at 18:00 RELATIVE TO forecast_date
-        ✅ Prevents optimizer from abandoning chargeable trips
-        ✅ Keeps SOS1 + strong branching
-        """
+        """Create depart_at, did_depart, fully_ready, at_sea variables with an 18:00 cutoff."""
 
         depart_at = {}
         depart_slots = {}
@@ -364,22 +308,17 @@ class BaseOptimizer:
         fully_ready = {}
         did_depart = {}
 
-        # ------------------------------------------------------------
-        # Hard operational cutoff: 18:00 relative to forecast_date
-        # ------------------------------------------------------------
         cutoff_time = forecast_date.replace(hour=18, minute=0, second=0)
         cutoff_t = int(
-            (cutoff_time - forecast_date).total_seconds()
-            / self.timestep_seconds
+            (cutoff_time - forecast_date).total_seconds() / self.timestep_seconds
         )
 
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
 
-            for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
+            for i, (t_deadline, _energy_req, dur) in enumerate(boat_trips):
                 t_orig_depart = t_deadline + 1
 
-                # --- compute maximum allowed delay ---
                 if i + 1 < len(boat_trips):
                     next_deadline = boat_trips[i + 1][0]
                     max_late = next_deadline - dur - t_orig_depart
@@ -388,7 +327,6 @@ class BaseOptimizer:
 
                 max_late = max(0, min(max_late, self.max_slack_timesteps))
 
-                # --- filter delay slots by cutoff ---
                 slots = []
                 for s in range(max_late + 1):
                     dep_t = t_orig_depart + s
@@ -406,17 +344,14 @@ class BaseOptimizer:
                     depart_at[(boat, i, s)] = v
                     slot_vars.append(v)
 
-                    # High priority: branch on departures early
                     model.chgVarBranchPriority(v, 100)
 
-                # At most one departure slot
                 if slot_vars:
                     model.addCons(
                         quicksum(slot_vars) <= 1,
                         name=f"one_depart_{boat}_trip{i+1}",
                     )
 
-                    # SOS1 for strong branching
                     if len(slot_vars) > 1:
                         model.addConsSOS1(
                             slot_vars,
@@ -424,7 +359,6 @@ class BaseOptimizer:
                             name=f"sos1_depart_{boat}_trip{i+1}",
                         )
 
-                # did_depart indicator
                 did_depart[(boat, i)] = model.addVar(
                     vtype="B",
                     name=f"did_depart_{boat}_trip{i+1}",
@@ -436,17 +370,14 @@ class BaseOptimizer:
                         name=f"did_depart_link_{boat}_trip{i+1}",
                     )
                 else:
-                    # No feasible slot → forced skip
                     model.addCons(
                         did_depart[(boat, i)] == 0,
                         name=f"did_depart_forced_skip_{boat}_trip{i+1}",
                     )
 
-                # fully_ready = on-time departure (slot 0)
                 if 0 in slots:
                     fully_ready[(boat, i)] = depart_at[(boat, i, 0)]
 
-                # --- at-sea variables ---
                 all_sea_times = set()
                 for s in slots:
                     dep_t = t_orig_depart + s
@@ -471,7 +402,9 @@ class BaseOptimizer:
                     ]
                     model.addCons(
                         at_sea[(boat, i, t)]
-                        == quicksum(depart_at[(boat, i, s)] for s in contributing_slots),
+                        == quicksum(
+                            depart_at[(boat, i, s)] for s in contributing_slots
+                        ),
                         name=f"sea_link_{boat}_trip{i+1}_t{t}",
                     )
 
@@ -483,12 +416,8 @@ class BaseOptimizer:
             "did_depart": did_depart,
         }
 
-
     def _add_boat_away_variables(self, model, timesteps, trip_events, at_sea):
-        """Aggregate at_sea across trips -> single boat_away per (boat, t).
-
-        One compact no-charge constraint per timestep (not per slot).
-        """
+        """Aggregate at_sea across trips into a single boat_away per (boat, t)."""
         boat_away = {}
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
@@ -509,12 +438,7 @@ class BaseOptimizer:
         return boat_away
 
     def _add_drain_variables(self, model, T, trip_events, departure_ctx):
-        """Return-drain with explicit continuous variables.
-
-        Keeping drain_at as explicit variables (rather than inlining
-        energy_req * depart_at) gives the LP relaxation tighter bounds
-        and avoids pseudo-bilinear structure in SOC dynamics.
-        """
+        """Return-drain with explicit continuous variables."""
         depart_at = departure_ctx["depart_at"]
         depart_slots = departure_ctx["depart_slots"]
         drain_at = {}
@@ -583,7 +507,6 @@ class BaseOptimizer:
             }
 
             for t in timesteps:
-                # One no-charge constraint per timestep (via aggregated boat_away)
                 if (boat, t) in boat_away:
                     model.addCons(
                         charger_power[charger_name][t]
@@ -611,18 +534,8 @@ class BaseOptimizer:
 
         return soc
 
-    # ------------------------------------------------------------------ #
-    #  Departure SOC constraints (tight big-M)                             #
-    # ------------------------------------------------------------------ #
-
     def _add_departure_soc_constraints(self, model, T, trip_events, soc, departure_ctx):
-        """SOC >= energy_req at actual departure.
-
-        Uses tight Big-M = energy_req (not battery_capacity).
-        When depart_at=0 the constraint relaxes to soc >= 0, which is
-        always satisfied by the variable bound.  This is the tightest
-        possible big-M for this formulation.
-        """
+        """Ensure SOC >= energy_req at actual departure using tight big-M = energy_req."""
         depart_at = departure_ctx["depart_at"]
         depart_slots = departure_ctx["depart_slots"]
 
@@ -632,8 +545,6 @@ class BaseOptimizer:
             for i, (t_deadline, energy_req, dur) in enumerate(boat_trips):
                 t_orig_depart = t_deadline + 1
                 slots = depart_slots[(boat, i)]
-                # Tight big-M: when depart_at=0, RHS becomes
-                # energy_req - energy_req = 0, and soc >= 0 is the var bound.
                 big_m = energy_req
 
                 for s in slots:
@@ -645,10 +556,6 @@ class BaseOptimizer:
                         >= energy_req - big_m * (1 - depart_at[(boat, i, s)]),
                         name=f"soc_req_{boat}_trip{i+1}_s{s}",
                     )
-
-    # ------------------------------------------------------------------ #
-    #  Symmetry breaking (strengthened)                                    #
-    # ------------------------------------------------------------------ #
 
     def _add_symmetry_breaking(self, model, trip_events, boat_list, departure_ctx):
         """Strong symmetry breaking across identical boats.
@@ -690,47 +597,6 @@ class BaseOptimizer:
                         name=f"sym_{b_curr}_trip{i+1}_s{s}",
                     )
 
-    # ------------------------------------------------------------------ #
-    #  MIP warm-start                                                      #
-    # ------------------------------------------------------------------ #
-
-    def _add_warm_start(self, model, trip_events, departure_ctx):
-        """Provide a greedy initial solution: all boats depart on time (slot 0).
-
-        This gives the solver a feasible starting point so it can prune
-        the search tree immediately rather than spending time finding
-        the first feasible solution.
-        """
-        depart_at = departure_ctx["depart_at"]
-        depart_slots = departure_ctx["depart_slots"]
-        did_depart = departure_ctx["did_depart"]
-
-        sol = model.createSol()
-
-        for boat in self.boat_charger_assignments:
-            boat_trips = trip_events.get(boat, [])
-            for i in range(len(boat_trips)):
-                slots = depart_slots.get((boat, i), [])
-                for s in slots:
-                    model.setSolVal(
-                        sol, depart_at[(boat, i, s)], 1.0 if s == 0 else 0.0
-                    )
-                if (boat, i) in did_depart:
-                    model.setSolVal(sol, did_depart[(boat, i)], 1.0)
-
-        # trySol lets SCIP complete continuous variables and check feasibility
-        accepted = model.trySol(sol)
-        if accepted:
-            print("     Warm-start: on-time solution accepted")
-        else:
-            print(
-                "     Warm-start: on-time solution infeasible, "
-                "solver starts from scratch"
-            )
-
-    # ------------------------------------------------------------------ #
-    #  Tariffs & objective                                                 #
-    # ------------------------------------------------------------------ #
 
     def _compute_tariff_prices(self, forecast_date, timesteps):
         return {
@@ -755,12 +621,10 @@ class BaseOptimizer:
         depart_slots = departure_ctx["depart_slots"]
         did_depart = departure_ctx["did_depart"]
 
-        # ----- Energy cost (only grid import carries a tariff) -----
         energy_cost = quicksum(
             grid_import[t] * tariff_price[t] * self.timestep_hours for t in timesteps
         )
 
-        # ----- Decaying reward for on-time departure -----
         n_boats = len(boat_list)
         base_reward = 1000.0
         ready_reward_terms = []
@@ -779,7 +643,6 @@ class BaseOptimizer:
 
         ready_reward = quicksum(ready_reward_terms) if ready_reward_terms else 0
 
-        # ----- Missed-trip penalty -----
         missed_penalty_terms = []
         for boat in self.boat_charger_assignments:
             boat_trips = trip_events.get(boat, [])
@@ -791,7 +654,6 @@ class BaseOptimizer:
             quicksum(missed_penalty_terms) if missed_penalty_terms else 0
         )
 
-        # ----- BESS end-of-day SOC penalty -----
         bess_end_penalty = 0
         if self.port.bess_systems and self.bess_end_soc_penalty > 0:
             T_last = timesteps[-1]
@@ -810,10 +672,6 @@ class BaseOptimizer:
             -ready_reward + missed_trip_penalty + energy_cost + bess_end_penalty,
             "minimize",
         )
-
-    # ------------------------------------------------------------------ #
-    #  Post-solve logging                                                  #
-    # ------------------------------------------------------------------ #
 
     def _log_departure_decisions(
         self, model, forecast_date, trip_events, departure_ctx
@@ -888,16 +746,12 @@ class BaseOptimizer:
         total_used = total_pv - total_export
         pct_used = (total_used / total_pv * 100) if total_pv > 0 else 0
 
-        print(f"     ☀️  PV:")
+        print("     ☀️  PV:")
         print(
             f"        Produced: {total_pv:7.2f} kWh   "
             f"Used: {total_used:7.2f} kWh ({pct_used:.1f}%)"
         )
         print(f"        Exported / curtailed: {total_export:7.2f} kWh")
-
-    # ------------------------------------------------------------------ #
-    #  Post-solve extraction                                               #
-    # ------------------------------------------------------------------ #
 
     def _extract_results(
         self,
@@ -941,10 +795,6 @@ class BaseOptimizer:
             total_cost=total_cost_val,
         )
 
-    # ------------------------------------------------------------------ #
-    #  Trip extraction                                                     #
-    # ------------------------------------------------------------------ #
-
     def _extract_trip_events(self, energy_forecasts):
         trips = defaultdict(list)
         T = len(energy_forecasts)
@@ -979,10 +829,6 @@ class BaseOptimizer:
                     t += 1
 
         return trips
-
-    # ------------------------------------------------------------------ #
-    #  Database persistence                                                #
-    # ------------------------------------------------------------------ #
 
     def save_schedules_to_db(self, result: BaseOptimizationResult) -> None:
         schedules = []
