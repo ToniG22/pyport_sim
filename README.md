@@ -79,7 +79,7 @@ pyport_sim/
 │   ├── engine.py          # Core simulation engine
 │   └── trip_manager.py    # Trip assignment and management
 ├── optimization/
-│   └── port_optimizer.py  # SCIP-based energy optimization
+│   └── base_optimizer.py  # SCIP-based energy optimization (charger/BESS schedules)
 ├── forecasting/
 │   └── port_forecaster.py # Energy consumption/production forecasting
 ├── database/
@@ -141,10 +141,9 @@ Set up solar panels:
 ```python
 pv_system = PV(
     name="Solar_Array_1",
-    capacity=30.0,          # kW DC
+    capacity=30.0,         # kW DC at STC
     tilt=30.0,             # degrees
     azimuth=180.0,         # degrees (180 = South-facing)
-    efficiency=0.85,       # System efficiency
     latitude=port.lat,
     longitude=port.lon,
 )
@@ -174,10 +173,12 @@ Configure simulation parameters:
 
 ```python
 settings = Settings(
-    timestep=900,                    # 15 minutes in seconds
-    mode=SimulationMode.BATCH,      # BATCH or REAL_TIME
-    db_path="port_simulation.db",    # Database file path
-    use_optimizer=True,              # Enable SCIP optimization
+    timestep=900,                     # 15 minutes in seconds
+    mode=SimulationMode.BATCH,        # BATCH or REAL_TIME
+    db_path="port_simulation.db",     # Database file path
+    use_optimizer=True,               # Enable SCIP optimization
+    power_limit_mode=False,           # Baseline power limiting without optimizer
+    trip_schedule=((9, 0), (14, 1)),  # Daily departures: (hour_utc, slot_index)
 )
 ```
 
@@ -227,7 +228,7 @@ The `SimulationEngine` manages the entire simulation:
 
 ### Optimization
 
-The `PortOptimizer` uses SCIP to optimize:
+The `BaseOptimizer` (in `optimization.base_optimizer`) uses SCIP to optimize:
 - Charger power schedules
 - BESS charge/discharge schedules
 - Minimize grid usage
