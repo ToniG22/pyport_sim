@@ -291,7 +291,7 @@ class SimulationEngine:
             self.latest_energy_forecasts = forecasts
 
             # Save to database
-            self.forecaster.save_forecasts_to_db(forecasts, forecast_type="port_energy")
+            self.forecaster.save_forecasts_to_db(forecasts)
 
             # Print summary
             self.forecaster.print_forecast_summary(forecasts)
