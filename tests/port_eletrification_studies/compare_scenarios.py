@@ -68,14 +68,15 @@ TRIP_DEPARTURE_HOURS: List[int] = [9, 14]
 # Colors per scenario (consistent across plots)
 COLORS: Dict[str, str] = {
     "no_opt_no_der": "#e74c3c",  # Red
-    "opt_no_der": "#3498db",     # Blue
-    "opt_der": "#2ecc71",        # Green
+    "opt_no_der": "#3498db",  # Blue
+    "opt_der": "#2ecc71",  # Green
 }
 
 
 # --------------------------------------------------------------------------- #
 #  Helpers
 # --------------------------------------------------------------------------- #
+
 
 def project_root() -> Path:
     """Return project root assuming this file lives in tests/port_eletrification_studies/."""
@@ -112,6 +113,7 @@ def _safe_dt_hours(index: pd.Series) -> float:
 # --------------------------------------------------------------------------- #
 #  Data loading helpers
 # --------------------------------------------------------------------------- #
+
 
 def load_port_timeseries(db_path: Path) -> pd.DataFrame:
     """
@@ -276,6 +278,7 @@ def load_boat_state_data(db_path: Path) -> pd.DataFrame:
 #  Reliability analysis
 # --------------------------------------------------------------------------- #
 
+
 @dataclass
 class ReliabilityStats:
     total_trips: int
@@ -285,11 +288,15 @@ class ReliabilityStats:
 
     @property
     def delay_rate(self) -> float:
-        return (self.delayed_trips / self.total_trips * 100) if self.total_trips else 0.0
+        return (
+            (self.delayed_trips / self.total_trips * 100) if self.total_trips else 0.0
+        )
 
     @property
     def cancel_rate(self) -> float:
-        return (self.cancelled_trips / self.total_trips * 100) if self.total_trips else 0.0
+        return (
+            (self.cancelled_trips / self.total_trips * 100) if self.total_trips else 0.0
+        )
 
 
 def analyze_reliability(db_path: Path, num_vessels: int) -> ReliabilityStats:
@@ -384,6 +391,7 @@ def analyze_reliability(db_path: Path, num_vessels: int) -> ReliabilityStats:
 # --------------------------------------------------------------------------- #
 #  Plotting helpers
 # --------------------------------------------------------------------------- #
+
 
 def plot_power_timeseries(
     vessels: int,
@@ -511,7 +519,8 @@ def plot_reliability(
     output_dir: Path,
 ) -> None:
     """
-    Plot stacked bars of on‑time / delayed / cancelled trips for each scenario.
+    Plot stacked bars of on-time / delayed / cancelled trips for each scenario.
+    Numbers are drawn inside the bars to avoid overlapping the title.
     """
     scenario_keys = [s for s in SCENARIOS.keys() if s in reliability_by_scenario]
     if not scenario_keys:
@@ -527,8 +536,10 @@ def plot_reliability(
 
     fig, ax = plt.subplots(figsize=(9, 5))
 
-    bars_on = ax.bar(x, on_time, width, label="On‑time", color="#2ecc71")
-    bars_del = ax.bar(x, delayed, width, bottom=on_time, label="Delayed", color="#f1c40f")
+    bars_on = ax.bar(x, on_time, width, label="On-time", color="#2ecc71")
+    bars_del = ax.bar(
+        x, delayed, width, bottom=on_time, label="Delayed", color="#f1c40f"
+    )
     bottom_cancel = [on_time[i] + delayed[i] for i in range(len(on_time))]
     bars_can = ax.bar(
         x,
@@ -547,21 +558,42 @@ def plot_reliability(
     ax.legend(fontsize=9)
     ax.grid(True, axis="y", alpha=0.3)
 
-    # Annotate bars
-    for bars in [bars_on, bars_del, bars_can]:
+    # Add a bit of headroom to ensure nothing clips
+    total_heights = [
+        on_time[i] + delayed[i] + cancelled[i] for i in range(len(on_time))
+    ]
+    max_total = max(total_heights) if total_heights else 0
+    ax.set_ylim(0, max_total * 1.1 if max_total > 0 else 1)
+
+    # Annotate bars INSIDE each segment
+    def annotate_segment(bars):
         for bar in bars:
             h = bar.get_height()
             if h <= 0:
                 continue
-            ax.annotate(
+
+            y = bar.get_y() + h / 2.0  # center of segment
+
+            # If segment is very small, move text slightly above
+            if h < 0.8:
+                y = bar.get_y() + h + 0.1
+                va = "bottom"
+            else:
+                va = "center"
+
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                y,
                 f"{int(h)}",
-                xy=(bar.get_x() + bar.get_width() / 2, bar.get_y() + h),
-                xytext=(0, 3),
-                textcoords="offset points",
                 ha="center",
-                va="bottom",
-                fontsize=8,
+                va=va,
+                fontsize=9,
+                color="black",
             )
+
+    annotate_segment(bars_on)
+    annotate_segment(bars_del)
+    annotate_segment(bars_can)
 
     plt.tight_layout()
     out_path = output_dir / f"reliability_{vessels}_vessels.png"
@@ -573,6 +605,7 @@ def plot_reliability(
 # --------------------------------------------------------------------------- #
 #  Summary table
 # --------------------------------------------------------------------------- #
+
 
 def build_summary_row(
     vessels: int,
@@ -645,9 +678,7 @@ def save_summary_table(
     rows: List[Dict[str, object]] = []
     for scenario in SCENARIOS.keys():
         ts = scenario_ts.get(scenario, pd.DataFrame())
-        rel = reliability_by_scenario.get(
-            scenario, ReliabilityStats(0, 0, 0, 0)
-        )
+        rel = reliability_by_scenario.get(scenario, ReliabilityStats(0, 0, 0, 0))
         rows.append(build_summary_row(vessels, scenario, ts, rel))
 
     df = pd.DataFrame(rows)
@@ -660,6 +691,7 @@ def save_summary_table(
 # --------------------------------------------------------------------------- #
 #  Main entry point
 # --------------------------------------------------------------------------- #
+
 
 def main() -> None:
     print("=" * 70)
@@ -716,4 +748,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
